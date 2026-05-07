@@ -39,10 +39,14 @@ fn printUsage(io: std.Io) void {
         \\  --mtp               Enable MTP (Multi-Token Prediction) speculative decoding
         \\                        Requires a model with `num_nextn_predict_layers > 0`
         \\                        in config.json (Qwen3.5+, Qwen3-Next).
-        \\  --pld               Enable Prompt Lookup Decoding (model-agnostic
-        \\                        speculative decoding via n-gram matches in the
-        \\                        prompt + generated tokens). Big wins on echo-heavy
-        \\                        workloads (code editing, RAG, agentic loops).
+        \\  --pld               Enable Prompt Lookup Decoding (default: ON).
+        \\                        Model-agnostic speculative decoding via n-gram
+        \\                        matches in the prompt + generated tokens. Big
+        \\                        wins on echo-heavy workloads (code editing, RAG,
+        \\                        agentic loops). Adaptive prompt-time gate
+        \\                        auto-disables it on novel content. Pass
+        \\                        --no-pld to force-disable.
+        \\  --no-pld            Force-disable Prompt Lookup Decoding.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
         \\  --drafter <dir>     Path to a Gemma 4 assistant drafter checkpoint.
@@ -95,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
     var enable_mtp = false; // MTP self-speculative decoding (off by default)
-    var enable_pld = false; // Prompt Lookup Decoding (off by default)
+    var enable_pld = true; // Prompt Lookup Decoding (on by default; --no-pld to disable)
     var pld_draft_len: u32 = 5;
     var pld_key_len: u32 = 3;
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint

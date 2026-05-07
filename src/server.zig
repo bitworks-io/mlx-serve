@@ -880,8 +880,16 @@ fn handleModels(
     // ── id falls back to architecture family if serve() didn't set it ──
     const model_id: []const u8 = if (global_model_id.len > 0) global_model_id else config.model_type;
 
+    // `context_length` is the *effective* working ceiling (user-supplied
+    // --ctx-size or memory-bounded computeMaxSafeContext). `model_max_tokens`
+    // is the model's own declared `max_position_embeddings` from config.json
+    // — independent of the running server's chosen context size — so UI code
+    // can show the true architectural cap without it shifting around when the
+    // user picks a different ctx-size.
+    // `supports_mtp` lets the UI grey out the "Enable MTP" toggle for models
+    // whose config doesn't declare MTP layers (most checkpoints).
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
+        \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"supports_mtp":{s}}}}}]}}
     , .{
         model_id,
         nowSecs(stream.io),
@@ -893,6 +901,8 @@ fn handleModels(
         config.num_hidden_layers,
         config.quant_bits,
         ctx_str,
+        config.max_position_embeddings,
+        if (config.has_mtp) "true" else "false",
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
@@ -1822,6 +1832,7 @@ fn handleChatCompletions(
     // get PLD even though it's likely a perf loss; user knows best.
     if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
         const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0; // on error, don't gate
+        log.info("  spec-gate: ngram-score={d:.3} (threshold={d:.3})\n", .{ score, spec_gate_threshold });
         if (score < spec_gate_threshold) {
             if (enable_pld and !pld_explicit_in_json) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
@@ -2568,6 +2579,14 @@ const StreamingTokenStream = struct {
                         // Emit first; mark finished so the next call returns null.
                         self.gen.done = true;
                         self.gen.finish_reason = "stop";
+                        self.finished = true;
+                    } else if (self.gen.completion_tokens > self.gen.max_tokens) {
+                        // Full-accept advanced completion_tokens by 2; if that
+                        // crosses max_tokens, suppress the second token to
+                        // avoid over-emit. The pair would otherwise smuggle a
+                        // single extra token past the cap.
+                        self.gen.done = true;
+                        self.gen.finish_reason = "length";
                         self.finished = true;
                     } else {
                         try self.pending_buf.append(allocator, s);
