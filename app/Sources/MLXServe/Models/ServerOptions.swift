@@ -22,7 +22,6 @@ struct ServerOptions: Codable, Equatable {
     var requestTimeout: Int = 300       // seconds; 0 = unlimited
 
     // Speculative decoding (server-launch flags)
-    var enableMTP: Bool = false         // --mtp (off by default; opt-in)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
     var pldKeyLen: Int = 3
@@ -40,7 +39,6 @@ struct ServerOptions: Codable, Equatable {
     var defaultEnableThinking: Bool = false
 
     // Per-request overrides for spec-decode (default = follow server default)
-    var perRequestEnableMTP: TriState = .auto
     var perRequestEnablePLD: TriState = .auto
     var perRequestEnableDrafter: TriState = .auto
 
@@ -81,7 +79,6 @@ struct ServerOptions: Codable, Equatable {
         noVision == other.noVision &&
         logLevel == other.logLevel &&
         requestTimeout == other.requestTimeout &&
-        enableMTP == other.enableMTP &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -111,7 +108,6 @@ struct ServerOptions: Codable, Equatable {
         }
         // Spec-decode: explicit flags either way so the server's CLI defaults
         // can't drift out from under the UI.
-        args += [enableMTP ? "--mtp" : "--no-mtp"]
         args += [enablePLD ? "--pld" : "--no-pld"]
         args += ["--pld-draft-len", "\(pldDraftLen)"]
         args += ["--pld-key-len", "\(pldKeyLen)"]
@@ -178,10 +174,6 @@ extension ServerOptions {
             title: "Request timeout (s)",
             explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
             needsRestart: true),
-        "enableMTP": .init(
-            title: "Enable MTP",
-            explainer: "Multi-Token Prediction speculative decoding. Available only when the loaded model declares MTP layers in its config (Qwen3.5+, Qwen3-Next).",
-            needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content.",
@@ -237,10 +229,6 @@ extension ServerOptions {
         "defaultEnableThinking": .init(
             title: "Enable thinking",
             explainer: "Default the chat client to send `enable_thinking: true`. Only models with reasoning support honor this.",
-            needsRestart: false),
-        "perRequestEnableMTP": .init(
-            title: "Per-request MTP",
-            explainer: "Auto = follow the server's --mtp setting. On/Off forces it for every request from this app.",
             needsRestart: false),
         "perRequestEnablePLD": .init(
             title: "Per-request PLD",

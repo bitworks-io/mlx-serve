@@ -91,7 +91,6 @@ private struct RestartBanner: View {
                     current.noVision = last.noVision
                     current.logLevel = last.logLevel
                     current.requestTimeout = last.requestTimeout
-                    current.enableMTP = last.enableMTP
                     current.enablePLD = last.enablePLD
                     current.pldDraftLen = last.pldDraftLen
                     current.pldKeyLen = last.pldKeyLen
@@ -363,18 +362,6 @@ private struct SpecDecodeSectionContent: View {
 
     var body: some View {
         let opts = $appState.serverOptions
-        // MTP availability gate: stays disabled while the server is stopped
-        // (we don't know yet) and when the loaded model's config doesn't
-        // declare MTP layers. We don't auto-clear `enableMTP` — we just keep
-        // the toggle inert. That way nothing changes server-side until the
-        // user explicitly toggles it after loading a supporting model.
-        let mtpAvailable = server.modelInfo?.supportsMTP ?? false
-        let mtpExplainerSuffix = mtpAvailable
-            ? ""
-            : (server.modelInfo == nil
-                ? " (start the server to detect MTP support)"
-                : " (loaded model has no MTP layers)")
-
         if let m = meta["enablePLD"] {
             SettingsRow(
                 title: m.title,
@@ -410,18 +397,6 @@ private struct SpecDecodeSectionContent: View {
                         .font(.body.monospacedDigit())
                 }
                 .disabled(!appState.serverOptions.enablePLD)
-            }
-        }
-        if let m = meta["enableMTP"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer + mtpExplainerSuffix,
-                isDirty: dirty.dirty(\.enableMTP)
-            ) {
-                Toggle("", isOn: opts.enableMTP)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .disabled(!mtpAvailable)
             }
         }
     }

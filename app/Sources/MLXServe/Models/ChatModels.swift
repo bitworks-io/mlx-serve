@@ -148,11 +148,6 @@ struct ModelInfo {
     /// only by what the architecture supports. Stable across server restarts;
     /// use this for UI like the "Model max" pill in Settings.
     var modelMaxTokens: Int
-    /// True when the loaded model declares MTP layers in its config (Qwen3.5+,
-    /// Qwen3-Next). Used by Settings to grey out the "Enable MTP" toggle on
-    /// models that can't use it. Note: even with this true, the safetensors
-    /// may have stripped MTP weights — `--mtp` will then silently fall back.
-    var supportsMTP: Bool
 }
 
 struct MemoryInfo {

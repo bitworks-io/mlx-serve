@@ -20,11 +20,9 @@ final class ServerOptionsTests: XCTestCase {
         // case (the server's own `getEffectiveContextLength` runs).
         XCTAssertFalse(contains(args, flag: "--ctx-size"))
 
-        // Spec-decode: PLD default-on, MTP default-off — the v5 flip from CLAUDE.md.
+        // Spec-decode: PLD default-on.
         XCTAssertTrue(args.contains("--pld"))
         XCTAssertFalse(args.contains("--no-pld"))
-        XCTAssertTrue(args.contains("--no-mtp"))
-        XCTAssertFalse(args.contains("--mtp"))
         XCTAssertTrue(contains(args, flag: "--pld-draft-len", value: "5"))
         XCTAssertTrue(contains(args, flag: "--pld-key-len", value: "3"))
 
@@ -112,7 +110,6 @@ final class ServerOptionsTests: XCTestCase {
     func testRoundTripCodable() throws {
         var opts = ServerOptions()
         opts.port = 9999
-        opts.enableMTP = true
         opts.drafterPath = "/x/y/z"
         opts.defaultTemperature = 0.42
         opts.perRequestEnableDrafter = .off

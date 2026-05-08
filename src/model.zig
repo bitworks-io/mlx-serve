@@ -141,20 +141,6 @@ pub const ModelConfig = struct {
     mamba_chunk_size: u32 = 256,
     mamba_mlp_act: HiddenAct = .relu_sq, // Nemotron-H MLP uses ReLU^2
 
-    // MTP (Multi-Token Prediction) self-speculative decoding head.
-    // Populated only for architectures that ship MTP weights (Qwen3.5+, Qwen3-Next);
-    // other model families ignore `num_nextn_predict_layers` even if present in JSON.
-    num_mtp_predict_layers: u32 = 0,
-    has_mtp: bool = false,
-
-    // MTP-specific quantization params, parsed from `mtplx_mtp_quantization` in
-    // config.json. Some MTPLX checkpoints (e.g. Qwen3.6-27B) quantize the MTP
-    // block linears with a different group_size than the main trunk; without
-    // these overrides, qmatmul mis-interprets the bit-packing and crashes.
-    has_mtp_quant_override: bool = false,
-    mtp_quant_bits: u32 = 4,
-    mtp_quant_group_size: u32 = 64,
-
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
         if (self.has_explicit_layer_types and layer_idx < 128) {
@@ -285,22 +271,6 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     defer allocator.free(content);
 
     return parseConfigFromJson(allocator, content);
-}
-
-/// Read MTP layer count from a Qwen-style config object. Accepts both
-/// `mtp_num_hidden_layers` (HF Qwen3.5 actual) and `num_nextn_predict_layers`
-/// (Qwen3-Next spec; sometimes used). Sets `has_mtp = true` only when >0.
-fn readMtpLayerCount(cfg_obj: std.json.ObjectMap, config: *ModelConfig) void {
-    const candidate_keys = [_][]const u8{ "mtp_num_hidden_layers", "num_nextn_predict_layers" };
-    for (candidate_keys) |key| {
-        if (cfg_obj.get(key)) |v| {
-            if (v == .integer and v.integer > 0) {
-                config.num_mtp_predict_layers = @intCast(v.integer);
-                config.has_mtp = true;
-                return;
-            }
-        }
-    }
 }
 
 /// I/O-free variant for unit tests and for callers that already have the
@@ -460,22 +430,6 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (q.get("group_size")) |v| config.quant_group_size = @intCast(v.integer);
     }
 
-    // Per-MTP-block quantization override (MTPLX checkpoints). Defaults to the
-    // main trunk's params; only flagged as an "override" if the values actually
-    // differ — that's what the bind path uses to decide whether to prepopulate
-    // the per-weight quant-params cache for MTP weights.
-    config.mtp_quant_bits = config.quant_bits;
-    config.mtp_quant_group_size = config.quant_group_size;
-    if (root.get("mtplx_mtp_quantization")) |mq_val| {
-        if (mq_val == .object) {
-            const mq = mq_val.object;
-            if (mq.get("bits")) |v| config.mtp_quant_bits = @intCast(v.integer);
-            if (mq.get("group_size")) |v| config.mtp_quant_group_size = @intCast(v.integer);
-            config.has_mtp_quant_override = (config.mtp_quant_bits != config.quant_bits) or
-                (config.mtp_quant_group_size != config.quant_group_size);
-        }
-    }
-
     // EOS tokens
     if (root.get("eos_token_id")) |v| {
         switch (v) {
@@ -587,12 +541,6 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
-        // MTP head metadata: HF Qwen3.5 ships `mtp_num_hidden_layers`; the spec
-        // also documents `num_nextn_predict_layers` (Qwen3-Next style). Accept both.
-        // Note: on MLX-converted checkpoints the field may be present as
-        // metadata even though the MTP weight tensors were stripped during
-        // conversion; weight-binder will fail loudly via getMtpWeight in that case.
-        readMtpLayerCount(cfg_obj, &config);
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -609,7 +557,6 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
-        readMtpLayerCount(cfg_obj, &config);
     } else if (std.mem.eql(u8, model_type, "lfm2") or std.mem.startsWith(u8, model_type, "lfm2")) {
         config.model_type = "lfm2";
         // VL variant nests text weights under language_model.model (like Gemma 4)
@@ -896,10 +843,11 @@ fn loadSafetensorsFile(
     }
 }
 
-/// True if the safetensors weight `key` should be retained for the text/MTP
+/// True if the safetensors weight `key` should be retained for the text
 /// forward pass. Audio is always dropped; vision is dropped unless
-/// `load_vision` is set. MTP keys (`*.mtp.*`) are always retained — they live
-/// under the standard text prefix and are needed for self-speculative decoding.
+/// `load_vision` is set. MTP-style head tensors (`*.mtp.*`) on Qwen3.5/3.6
+/// checkpoints are kept (the binder ignores them, but the loader doesn't
+/// need to know that).
 pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
@@ -1134,201 +1082,11 @@ test "ModelConfig BERT has no sliding window" {
     try testing.expect(config.isGlobalLayer(5));
 }
 
-// ── MTP (Multi-Token Prediction) ──────────────────────────────────────────
-//
-// Qwen3.5 / Qwen3.6 / Qwen3-Next ship a native MTP head in their safetensors.
-// `num_nextn_predict_layers` in config.json gives the count (always 1 in shipped
-// checkpoints today). The head is a single transformer block trained to predict
-// token N+2 from `(hidden_state_N, embed(token_N+1))`. Used for self-speculative
-// decoding: draft with the MTP head, verify with a length-2 main forward.
-
-test "ModelConfig MTP defaults" {
-    const config = ModelConfig{};
-    try testing.expectEqual(@as(u32, 0), config.num_mtp_predict_layers);
-    try testing.expect(!config.has_mtp);
-}
-
-test "parseConfigFromJson reads mtp_num_hidden_layers (HF Qwen3.5 actual field)" {
-    // Real Qwen3.5 checkpoints from Hugging Face use `mtp_num_hidden_layers`
-    // inside text_config, not the spec-style `num_nextn_predict_layers`. Both
-    // must be honored.
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5",
-        \\  "text_config": {
-        \\    "model_type": "qwen3_5_text",
-        \\    "vocab_size": 248320,
-        \\    "hidden_size": 2560,
-        \\    "intermediate_size": 9216,
-        \\    "num_hidden_layers": 32,
-        \\    "num_attention_heads": 16,
-        \\    "num_key_value_heads": 4,
-        \\    "head_dim": 256,
-        \\    "mtp_num_hidden_layers": 1
-        \\  }
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expectEqual(@as(u32, 1), config.num_mtp_predict_layers);
-    try testing.expect(config.has_mtp);
-}
-
-test "parseConfigFromJson reads num_nextn_predict_layers for qwen3_5_moe" {
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5_moe",
-        \\  "vocab_size": 151936,
-        \\  "hidden_size": 2048,
-        \\  "intermediate_size": 6144,
-        \\  "num_hidden_layers": 48,
-        \\  "num_attention_heads": 16,
-        \\  "num_key_value_heads": 2,
-        \\  "head_dim": 128,
-        \\  "num_nextn_predict_layers": 1
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expectEqual(@as(u32, 1), config.num_mtp_predict_layers);
-    try testing.expect(config.has_mtp);
-    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
-}
-
-test "parseConfigFromJson reads num_nextn_predict_layers for qwen3_next" {
-    const json =
-        \\{
-        \\  "model_type": "qwen3_next",
-        \\  "vocab_size": 151936,
-        \\  "hidden_size": 2048,
-        \\  "intermediate_size": 5120,
-        \\  "num_hidden_layers": 48,
-        \\  "num_attention_heads": 16,
-        \\  "num_key_value_heads": 2,
-        \\  "head_dim": 128,
-        \\  "num_nextn_predict_layers": 1
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expectEqual(@as(u32, 1), config.num_mtp_predict_layers);
-    try testing.expect(config.has_mtp);
-    try testing.expectEqualStrings("qwen3_next", config.model_type);
-}
-
-test "parseConfigFromJson defaults num_nextn_predict_layers to 0 when absent" {
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5_moe",
-        \\  "vocab_size": 151936,
-        \\  "hidden_size": 2048,
-        \\  "intermediate_size": 6144,
-        \\  "num_hidden_layers": 48,
-        \\  "num_attention_heads": 16,
-        \\  "num_key_value_heads": 2,
-        \\  "head_dim": 128
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expectEqual(@as(u32, 0), config.num_mtp_predict_layers);
-    try testing.expect(!config.has_mtp);
-}
-
-test "parseConfigFromJson reads mtplx_mtp_quantization override (different group_size)" {
-    // Qwen3.6-27B-MTPLX-Optimized-Speed: main is bits=4 group=64, MTP block is
-    // bits=4 group=32. Without this override the qmatmul detector misreads
-    // bit-packing on MTP weights and crashes with a shape mismatch.
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5_moe",
-        \\  "vocab_size": 151936,
-        \\  "hidden_size": 2048,
-        \\  "intermediate_size": 6144,
-        \\  "num_hidden_layers": 48,
-        \\  "num_attention_heads": 16,
-        \\  "num_key_value_heads": 2,
-        \\  "head_dim": 128,
-        \\  "num_nextn_predict_layers": 1,
-        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
-        \\  "mtplx_mtp_quantization": {"bits": 4, "group_size": 32, "mode": "affine"}
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(config.has_mtp);
-    try testing.expect(config.has_mtp_quant_override);
-    try testing.expectEqual(@as(u32, 4), config.quant_bits);
-    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
-    try testing.expectEqual(@as(u32, 4), config.mtp_quant_bits);
-    try testing.expectEqual(@as(u32, 32), config.mtp_quant_group_size);
-}
-
-test "parseConfigFromJson mtplx override matching trunk does not flag has_mtp_quant_override" {
-    // Qwen3.5-4B-MTPLX-Optimized-Speed: MTP block uses the SAME bits/group as
-    // the main trunk (4/64). The override field is present but identical, so
-    // we shouldn't flag it as needing per-weight cache prepopulation.
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5_moe",
-        \\  "vocab_size": 151936,
-        \\  "hidden_size": 2048,
-        \\  "intermediate_size": 6144,
-        \\  "num_hidden_layers": 48,
-        \\  "num_attention_heads": 16,
-        \\  "num_key_value_heads": 2,
-        \\  "head_dim": 128,
-        \\  "num_nextn_predict_layers": 1,
-        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
-        \\  "mtplx_mtp_quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(!config.has_mtp_quant_override);
-    try testing.expectEqual(@as(u32, 4), config.mtp_quant_bits);
-    try testing.expectEqual(@as(u32, 64), config.mtp_quant_group_size);
-}
-
-test "parseConfigFromJson mtp_quant_* defaults to main quant when override absent" {
-    const json =
-        \\{
-        \\  "model_type": "qwen3_5_moe",
-        \\  "vocab_size": 151936,
-        \\  "hidden_size": 2048,
-        \\  "intermediate_size": 6144,
-        \\  "num_hidden_layers": 48,
-        \\  "num_attention_heads": 16,
-        \\  "num_key_value_heads": 2,
-        \\  "head_dim": 128,
-        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(!config.has_mtp_quant_override);
-    try testing.expectEqual(@as(u32, 4), config.mtp_quant_bits);
-    try testing.expectEqual(@as(u32, 64), config.mtp_quant_group_size);
-}
-
-test "parseConfigFromJson does not enable MTP for non-Qwen architectures" {
-    // num_nextn_predict_layers in a llama config (synthetic) should be ignored
-    // — only Qwen variants currently have working MTP weights.
-    const json =
-        \\{
-        \\  "model_type": "llama",
-        \\  "vocab_size": 32000,
-        \\  "hidden_size": 4096,
-        \\  "intermediate_size": 11008,
-        \\  "num_hidden_layers": 32,
-        \\  "num_attention_heads": 32,
-        \\  "num_key_value_heads": 32,
-        \\  "head_dim": 128,
-        \\  "num_nextn_predict_layers": 1
-        \\}
-    ;
-    const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(!config.has_mtp);
-}
-
-test "shouldKeepWeightKey accepts MTP head weights" {
-    // MTP head weights live under `{prefix}.mtp.{layer_idx}.{name}` in HF
-    // safetensors (e.g. `language_model.model.mtp.0.eh_proj.weight`). The
-    // safetensors iterator filter must let them through (they're neither
-    // vision nor audio) regardless of `load_vision`.
+test "shouldKeepWeightKey accepts orphan MTP head weights on Qwen3.5/3.6 checkpoints" {
+    // MTPLX-style Qwen3.5/3.6 checkpoints ship `*.mtp.*` tensors even though
+    // we no longer have an MTP head. The safetensors iterator must let them
+    // through (they're neither vision nor audio) so the model loads cleanly;
+    // the binder simply ignores them.
     try testing.expect(shouldKeepWeightKey("language_model.model.mtp.0.eh_proj.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.mtp.0.eh_proj.weight", false));
     try testing.expect(shouldKeepWeightKey("model.mtp.0.shared_head.head.weight", false));

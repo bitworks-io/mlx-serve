@@ -36,9 +36,6 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
-        \\  --mtp               Enable MTP (Multi-Token Prediction) speculative decoding
-        \\                        Requires a model with `num_nextn_predict_layers > 0`
-        \\                        in config.json (Qwen3.5+, Qwen3-Next).
         \\  --pld               Enable Prompt Lookup Decoding (default: ON).
         \\                        Model-agnostic speculative decoding via n-gram
         \\                        matches in the prompt + generated tokens. Big
@@ -53,7 +50,7 @@ fn printUsage(io: std.Io) void {
         \\                        When set, the drafter is loaded at startup,
         \\                        bound to the target model, and used as the
         \\                        default draft source for new requests
-        \\                        (priority: drafter > MTP > PLD > regular).
+        \\                        (priority: drafter > PLD > regular).
         \\  --draft-block-size <n>  Tokens per drafter round (default: 4 = 3
         \\                        drafter steps + 1 verify token).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
@@ -98,7 +95,6 @@ pub fn main(init: std.process.Init) !void {
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
-    var enable_mtp = false; // MTP self-speculative decoding (off by default)
     var enable_pld = true; // Prompt Lookup Decoding (on by default; --no-pld to disable)
     var pld_draft_len: u32 = 5;
     var pld_key_len: u32 = 3;
@@ -145,10 +141,6 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
-        } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            enable_mtp = true;
-        } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
-            enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--pld")) {
             enable_pld = true;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
@@ -318,13 +310,7 @@ pub fn main(init: std.process.Init) !void {
     log.info("Model ready.\n", .{});
 
     if (serve_mode) {
-        // Start HTTP server
-        // MTP guardrail: --mtp on a model without an MTP head silently downgrades.
-        const mtp_active = enable_mtp and config.has_mtp;
-        if (enable_mtp and !config.has_mtp) {
-            log.warn("--mtp requested but model has no MTP head (num_nextn_predict_layers=0); running without speculative decoding.\n", .{});
-        }
-
+        // Start HTTP server.
         // Optional Gemma 4 assistant drafter. Loaded once at startup; held for
         // the lifetime of the server. `bind` validates the drafter+target
         // pair (backbone hidden size, layer-type compatibility); failure
@@ -355,7 +341,7 @@ pub fn main(init: std.process.Init) !void {
             log.info("Drafter ready (block_size={d}).\n", .{draft_block_size});
         }
 
-        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, mtp_active, enable_pld, pld_draft_len, pld_key_len, drafter_ptr, draft_block_size);
+        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, enable_pld, pld_draft_len, pld_key_len, drafter_ptr, draft_block_size);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{

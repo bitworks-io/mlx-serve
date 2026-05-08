@@ -104,8 +104,7 @@ class APIClient {
             hiddenSize: meta["hidden_size"] as? Int ?? 0,
             vocabSize: meta["vocab_size"] as? Int ?? 0,
             contextLength: meta["context_length"] as? Int ?? 0,
-            modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
-            supportsMTP: meta["supports_mtp"] as? Bool ?? false
+            modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0
         )
     }
 
@@ -140,7 +139,6 @@ class APIClient {
         var repeatPenalty: Double? = nil
         var presencePenalty: Double? = nil
         var reasoningBudget: Int? = nil
-        var enableMTP: Bool? = nil
         var enablePLD: Bool? = nil
         var enableDrafter: Bool? = nil
 
@@ -158,7 +156,6 @@ class APIClient {
             r.repeatPenalty = opts.defaultRepeatPenalty != 1.0 ? opts.defaultRepeatPenalty : nil
             r.presencePenalty = opts.defaultPresencePenalty != 0.0 ? opts.defaultPresencePenalty : nil
             r.reasoningBudget = opts.defaultReasoningBudget >= 0 ? opts.defaultReasoningBudget : nil
-            r.enableMTP = opts.perRequestEnableMTP.asOptionalBool
             r.enablePLD = opts.perRequestEnablePLD.asOptionalBool
             r.enableDrafter = opts.perRequestEnableDrafter.asOptionalBool
             return r
@@ -261,7 +258,6 @@ class APIClient {
             if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
             if let v = defaults.presencePenalty { parts.append("\"presence_penalty\":\(v)") }
             if let v = defaults.reasoningBudget { parts.append("\"reasoning_budget\":\(v)") }
-            if let v = defaults.enableMTP { parts.append("\"enable_mtp\":\(v)") }
             if let v = defaults.enablePLD { parts.append("\"enable_pld\":\(v)") }
             if let v = defaults.enableDrafter { parts.append("\"enable_drafter\":\(v)") }
             parts.append("\"tools\":\(toolsJSON)")
@@ -281,7 +277,6 @@ class APIClient {
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }
             if let v = defaults.presencePenalty { body["presence_penalty"] = v }
             if let v = defaults.reasoningBudget { body["reasoning_budget"] = v }
-            if let v = defaults.enableMTP { body["enable_mtp"] = v }
             if let v = defaults.enablePLD { body["enable_pld"] = v }
             if let v = defaults.enableDrafter { body["enable_drafter"] = v }
             if let tools { body["tools"] = tools }

@@ -1,5 +1,14 @@
 # Changelog
 
+## v26.5.5 — Remove MTP self-speculative decoding
+
+- **Remove MTP** (Multi-Token Prediction) self-speculative decoding entirely. Bench on 2026-05-08 across every MTP-bearing model (Qwen 3.5 4B MTPLX, Qwen 3.6 27B / 35B-A3B with MTP heads, mlx-community Qwen 3.6 27B-mtp) showed MTP **at parity or slower** than the regular path on all of them, including the heavy-echo workload it was designed for (≤ 0.99×). PLD covers the same use case with bigger wins (1.45–1.89× heavy-echo) and zero per-model setup, and the Gemma 4 assistant drafter handles the targeted cases where it pays off.
+- **The four MTP-bearing checkpoints continue to load and run as regular Qwen models.** Their `*.mtp.*` safetensor tensors are simply ignored — the binder no longer probes them, and `shouldKeepWeightKey` keeps letting them through so the loader doesn't have to care.
+- **CLI / API surface dropped**: `--mtp` / `--no-mtp`, `enable_mtp` request field, `supports_mtp` in `/v1/models`, and the matching Swift app toggle and tests are all gone. Spec-decode priority is now `drafter > PLD > regular`.
+- **Net diff**: roughly -2200 lines across `src/transformer.zig` (weight binder, forward pass, ~1100 lines), `src/generate.zig` (`nextMtp`, runtime gate, helpers, ~600 lines), `src/server.zig` (CLI/API plumbing, ~150 lines), `src/model.zig` (config parsing + tests, ~150 lines), the Swift app, the bench scripts, and the docs. PLD's own helpers (`probsAtLastPos`, `probAt`, `sampleFromProbs`, `sampleResidual`) keep their behavior — only the `mtp` prefixes were dropped.
+
+---
+
 ## v26.5.4 — Speculative decoding (MTP / PLD / Gemma 4 drafter), Settings window, tokenizer fix
 
 - **MTP (Multi-Token Prediction)**: native self-speculative decoding for Qwen3.5/3.6/Qwen3-Next checkpoints that ship MTP weights. `--mtp` flag and per-request `enable_mtp`. Snapshot/restore handles hybrid GatedDeltaNet rollback; tools/logprobs/grammar auto-disable.

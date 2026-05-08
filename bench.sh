@@ -20,27 +20,20 @@ MODEL_TABLE=(
     # MoE
     "gemma26b-moe|$MODELS_DIR/gemma-4-26b-a4b-it-4bit|$MODELS_DIR/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it|$MODELS_DIR/mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
     "qwen35b-moe|$MODELS_DIR/Qwen3.6-35B-A3B-6bit|$MODELS_DIR/Qwen3.6-35B-A3B-6bit|qwen3.6-35b-a3b@6bit|"
-    # MoE + native MTP head (Qwen 3.6 35B-A3B with the MTP weights baked in)
-    "qwen35b-moe-mtp|$MODELS_DIR/mlx-community/Qwen3.6-35B-A3B-mtp-4bit|$MODELS_DIR/mlx-community/Qwen3.6-35B-A3B-mtp-4bit|||"
     # Dense
     "gemma31b|$MODELS_DIR/gemma-4-31b-it-8bit|$MODELS_DIR/gemma-4-31b-it-8bit|gemma-4-31b-it|$MODELS_DIR/mlx-community/gemma-4-31B-it-assistant-bf16"
     "qwen36-27b|$MODELS_DIR/Qwen3.6-27B-4bit|$MODELS_DIR/Qwen3.6-27B-4bit|qwen/qwen3.6-27b|"
-    # Dense + native MTP head (Qwen 3.6 27B with MTP weights)
-    "qwen36-27b-mtp-v2|$MODELS_DIR/mlx-community/Qwen3.6-27B-mtp|$MODELS_DIR/mlx-community/Qwen3.6-27B-mtp|||"
     # Drafter pairings (Gemma 4 dense + assistant). Drafter dir is the small
     # 4-layer assistant Google ships alongside Gemma 4 — only mlx-serve
     # supports it, and the bench skips the drafter spec cell if the dir is
     # absent on disk.
     "gemma4-e4b|$MODELS_DIR/gemma-4-e4b-it-8bit|$MODELS_DIR/gemma-4-e4b-it-8bit|gemma-4-e4b-it|$MODELS_DIR/mlx-community/gemma-4-E4B-it-assistant-bf16"
-    # MTP (Qwen MTPLX speed builds — full-model MTP fork)
-    "qwen35-4b-mtp|$MODELS_DIR/Qwen3.5-4B-MTPLX-Optimized-Speed|$MODELS_DIR/Qwen3.5-4B-MTPLX-Optimized-Speed|||"
-    "qwen36-27b-mtp|$MODELS_DIR/Qwen3.6-27B-MTPLX-Optimized-Speed|$MODELS_DIR/Qwen3.6-27B-MTPLX-Optimized-Speed|||"
 )
 
 # Templates: name → "logical_models|specs_for_mlxserve"
-# Spec sets: `none,pld` for moe/dense; `none,drafter` for drafter; `none,mtp` for mtp.
+# Spec sets: `none,pld` for moe/dense; `none,drafter` for drafter.
 # When --engine all is used, non-mlx-serve engines run the `none` baseline only
-# (since they don't support drafter/mtp, and even pld is mlx-serve-specific).
+# (since they don't support drafter, and even pld is mlx-serve-specific).
 TEMPLATE_MOE_MODELS=("gemma26b-moe" "qwen35b-moe")
 TEMPLATE_MOE_SPECS=("none" "pld")
 
@@ -49,9 +42,6 @@ TEMPLATE_DENSE_SPECS=("none" "pld")
 
 TEMPLATE_DRAFTER_MODELS=("gemma4-e4b" "gemma26b-moe" "gemma31b")
 TEMPLATE_DRAFTER_SPECS=("none" "drafter")
-
-TEMPLATE_MTP_MODELS=("qwen35-4b-mtp" "qwen36-27b-mtp" "qwen36-27b-mtp-v2" "qwen35b-moe-mtp")
-TEMPLATE_MTP_SPECS=("none" "mtp")
 
 # ── Default args ──
 TEMPLATE=""
@@ -72,8 +62,6 @@ Templates (hardcoded model + spec sets):
   dense       Gemma 4 31B      +  Qwen 3.6 27B              [specs: none, pld]
   drafter     Gemma 4 E4B + assistant drafter               [specs: none, drafter]
               (drafter spec runs on mlx-serve only)
-  mtp         Qwen 3.5 4B + Qwen 3.6 27B (MTPLX builds)     [specs: none, mtp]
-              (mtp spec runs on mlx-serve only)
   --corpus    PLD threshold-tuning corpus on Gemma 4 E4B.
               9 prompts × pld-on/pld-off; reports per-prompt n-gram score and
               ratio. (No --engine; mlx-serve only.)
@@ -86,7 +74,7 @@ Options:
   --binary <path>   mlx-serve binary                        (default: ./zig-out/bin/mlx-serve)
   --echo            Add an extra heavy-echo decode cell to each run.
                     Recitation-style prompt that exercises spec-decode
-                    n-gram lookahead — the workload PLD/MTP/drafter target.
+                    n-gram lookahead — the workload PLD/drafter target.
   -h, --help        This message
 
 Output: pipe-separated rows on stdout.
@@ -105,7 +93,7 @@ EOF
 # Two-pass arg parse: first positional = template (unless --corpus is given).
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        moe|dense|drafter|mtp)  TEMPLATE="$1"; shift ;;
+        moe|dense|drafter)      TEMPLATE="$1"; shift ;;
         --corpus)               CORPUS=1; shift ;;
         --engine)               ENGINE="$2"; shift 2 ;;
         --runs)                 RUNS="$2"; shift 2 ;;
@@ -119,7 +107,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$CORPUS" == "0" && -z "$TEMPLATE" ]]; then
-    echo "Error: pass a template (moe|dense|drafter|mtp) or --corpus" >&2
+    echo "Error: pass a template (moe|dense|drafter) or --corpus" >&2
     echo
     usage
     exit 1
@@ -153,14 +141,14 @@ engines_for() {
     fi
 }
 
-# Spec applies to engine? Drafter/mtp are mlx-serve only; pld is mlx-serve only too
-# (but other engines run the baseline for comparability via spec=none). Returns 0
-# if the (engine, spec) combo is supported.
+# Spec applies to engine? Drafter and PLD are mlx-serve only (other engines
+# run the baseline for comparability via spec=none). Returns 0 if the
+# (engine, spec) combo is supported.
 spec_applies() {
     local engine="$1" spec="$2"
     case "$spec" in
         none) return 0 ;;
-        pld|mtp|drafter) [[ "$engine" == "mlx-serve" ]] && return 0 || return 1 ;;
+        pld|drafter) [[ "$engine" == "mlx-serve" ]] && return 0 || return 1 ;;
         *) return 1 ;;
     esac
 }
@@ -298,7 +286,6 @@ case "$TEMPLATE" in
     moe)     models=("${TEMPLATE_MOE_MODELS[@]}");     specs=("${TEMPLATE_MOE_SPECS[@]}") ;;
     dense)   models=("${TEMPLATE_DENSE_MODELS[@]}");   specs=("${TEMPLATE_DENSE_SPECS[@]}") ;;
     drafter) models=("${TEMPLATE_DRAFTER_MODELS[@]}"); specs=("${TEMPLATE_DRAFTER_SPECS[@]}") ;;
-    mtp)     models=("${TEMPLATE_MTP_MODELS[@]}");     specs=("${TEMPLATE_MTP_SPECS[@]}") ;;
     *)       echo "unreachable"; exit 1 ;;
 esac
 

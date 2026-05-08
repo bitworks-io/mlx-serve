@@ -10,7 +10,7 @@
 #   bench_run.sh \
 #     --engine <mlx-serve|mlx-lm|lmstudio> \
 #     --model <path|key>          \  # mlx-serve/mlx-lm: local path; lmstudio: model-key
-#     --spec  <none|pld|mtp|drafter> \
+#     --spec  <none|pld|drafter> \
 #     [--drafter-dir <path>]      \  # required for spec=drafter (mlx-serve only)
 #     [--port N]                  \  # default 11240; lmstudio always 1234
 #     [--runs N]                  \  # default 3; run 1 is warmup, dropped
@@ -50,7 +50,7 @@ QUIET=0
 # Fixed prompts so prefill/decode rates are reproducible.
 PREFILL_PROMPT="Explain the following topics in extreme detail: $(python3 -c "print(', '.join([f'topic {i} about science and technology and its impact on human civilization throughout history' for i in range(1,50)]))")"
 DECODE_PROMPT="Write a detailed essay about quantum computing"
-# Heavy-echo: the canonical workload for spec-decode (PLD/MTP/drafter). Output
+# Heavy-echo: the canonical workload for spec-decode (PLD/drafter). Output
 # is the input verbatim, so n-gram lookahead nearly always hits.
 ECHO_PROMPT="Repeat the following paragraph back to me word for word, exactly as written, with no additional commentary. Then add the single sentence \"End of recitation.\" on a new line. PARAGRAPH: The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump. The five boxing wizards jump quickly. Jackdaws love my big sphinx of quartz. Bright vixens jump; dozy fowl quack. Sphinx of black quartz, judge my vow. Two driven jocks help fax my big quiz. Now repeat the paragraph above exactly:"
 
@@ -100,7 +100,6 @@ start_engine() {
             case "$SPEC" in
                 none)    extra="--no-pld" ;;
                 pld)     extra="" ;; # default-on
-                mtp)     extra="--no-pld --mtp" ;;
                 drafter) [[ -z "$DRAFTER_DIR" ]] && fail "spec=drafter needs --drafter-dir"
                          extra="--no-pld --drafter $DRAFTER_DIR" ;;
                 *)       fail "bad spec: $SPEC" ;;
@@ -173,10 +172,9 @@ build_body() {
         # enable_thinking:false applies on Qwen3.5/3.6 dense; ignored elsewhere.
         # enable_*: per-request override of the spec-decode mode the server was started with.
         case "$SPEC" in
-            none)    extra=',"enable_pld":false,"enable_mtp":false,"enable_drafter":false,"enable_thinking":false' ;;
-            pld)     extra=',"enable_pld":true,"enable_mtp":false,"enable_drafter":false,"enable_thinking":false' ;;
-            mtp)     extra=',"enable_pld":false,"enable_mtp":true,"enable_drafter":false,"enable_thinking":false' ;;
-            drafter) extra=',"enable_pld":false,"enable_mtp":false,"enable_drafter":true,"enable_thinking":false' ;;
+            none)    extra=',"enable_pld":false,"enable_drafter":false,"enable_thinking":false' ;;
+            pld)     extra=',"enable_pld":true,"enable_drafter":false,"enable_thinking":false' ;;
+            drafter) extra=',"enable_pld":false,"enable_drafter":true,"enable_thinking":false' ;;
         esac
     elif [[ "$ENGINE" == "lmstudio" ]]; then
         # LM Studio honours top-level chat-template hints in `chat_template_kwargs`.
