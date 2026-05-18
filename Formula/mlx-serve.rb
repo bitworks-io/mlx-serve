@@ -23,6 +23,15 @@ class MlxServe < Formula
            "#{libexec}/libmlx.dylib",
            "#{libexec}/libmlxc.dylib"
 
+    # libwebp ships bundled with install_name @executable_path/lib/libwebp.dylib;
+    # repoint to libexec since Homebrew splits bin/ and libexec/.
+    if File.exist?("#{libexec}/libwebp.dylib")
+      system "install_name_tool", "-change",
+             "@executable_path/lib/libwebp.dylib",
+             "#{libexec}/libwebp.dylib",
+             "#{bin}/mlx-serve"
+    end
+
     # Re-sign after rpath patching (hardened runtime invalidates on modification)
     system "codesign", "--force", "--sign", "-", "#{libexec}/libmlxc.dylib"
     system "codesign", "--force", "--sign", "-", "#{bin}/mlx-serve"
