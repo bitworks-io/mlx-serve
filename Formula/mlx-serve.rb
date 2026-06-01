@@ -32,6 +32,13 @@ class MlxServe < Formula
              "#{bin}/mlx-serve"
     end
 
+    if File.exist?("#{libexec}/libllama.dylib")
+      system "install_name_tool", "-change",
+             "@executable_path/lib/libllama.dylib",
+             "#{libexec}/libllama.dylib",
+             "#{bin}/mlx-serve"
+    end
+
     # Re-sign after rpath patching (hardened runtime invalidates on modification)
     system "codesign", "--force", "--sign", "-", "#{libexec}/libmlxc.dylib"
     system "codesign", "--force", "--sign", "-", "#{bin}/mlx-serve"
