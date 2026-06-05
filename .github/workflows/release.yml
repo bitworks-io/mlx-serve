@@ -272,8 +272,11 @@ jobs:
             [ -f "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
           done
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXCore"
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP"
+          # MLXCore + the .app need the mic entitlement, or Voice mode is denied
+          # microphone access under hardened runtime without ever prompting.
+          # Frameworks/dylibs and the headless mlx-serve must NOT carry it.
+          codesign --force --options runtime --entitlements app/MLXCore.entitlements --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXCore"
+          codesign --force --options runtime --entitlements app/MLXCore.entitlements --sign "$SIGNING_IDENTITY" "$APP"
 
           codesign --verify --deep --strict --verbose=2 "$APP"
           ditto -c -k --keepParent "$APP" "MLXCore-app.zip"
