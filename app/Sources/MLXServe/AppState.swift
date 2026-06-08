@@ -66,6 +66,9 @@ class AppState: ObservableObject {
     }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
+    /// Set when a task notification is tapped — the Tasks window observes this to
+    /// focus the relevant task, then clears it.
+    @Published var pendingTaskDeepLink: UUID?
     /// Set by the menu bar's Voice action; the chat detail view consumes it to
     /// auto-start Voice mode (whether the window was already open or just opened).
     @Published var pendingVoiceLaunch = false
@@ -111,6 +114,10 @@ class AppState: ObservableObject {
     /// is independent of any window.
     lazy var chatEngine = ChatTurnEngine(appState: self)
 
+    /// Runs unattended scheduled/on-demand agent tasks (the "claw" spine). Lazily
+    /// created so it only spins up the first time the Tasks window is opened.
+    lazy var taskScheduler = TaskScheduler(appState: self)
+
     /// The persistent, window-independent voice assistant. Owned here (not in a
     /// view) so it survives chat-window open/close and runs from the menu-bar
     /// tray. `bind` wires it to `chatEngine` and the active session once.
@@ -151,6 +158,10 @@ class AppState: ObservableObject {
 
         refreshModels()
         loadChatHistory()
+        // Start background task scheduling (catch-up + timer arming). Notifications
+        // route back here to resume paused runs / deep-link into the Tasks window.
+        TaskNotifier.shared.appState = self
+        taskScheduler.start()
         if ProcessInfo.processInfo.environment["TESTING_MODE"] != nil {
             testServer.start(appState: self)
         }
@@ -200,6 +211,11 @@ class AppState: ObservableObject {
     }
 
     // MARK: - Chat Session Management
+
+    /// Sessions to show in the chat sidebar — excludes transient task-run vehicles.
+    var visibleChatSessions: [ChatSession] {
+        chatSessions.filter { $0.taskRunId == nil }
+    }
 
     func newChatSession() -> UUID {
         let session = ChatSession()
@@ -281,7 +297,11 @@ class AppState: ObservableObject {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = .prettyPrinted
-        guard let data = try? encoder.encode(chatSessions) else { return }
+        // Transient task-run sessions live in `chatSessions` only while their run is
+        // in flight (the agent loop reads/appends through AppState). They are never
+        // persisted here — their transcript is saved out of line by TaskScheduler.
+        let persisted = chatSessions.filter { $0.taskRunId == nil }
+        guard let data = try? encoder.encode(persisted) else { return }
         try? data.write(to: URL(fileURLWithPath: historyPath))
     }
 

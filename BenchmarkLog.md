@@ -331,3 +331,139 @@ Plan C2 would extend the existing `compileGelu`/`compileGeglu`/`compileMoeRoutin
 ### Correctness — all 7 archs still pass the 11-turn agent memory test
 
 Same as the 2026-05-16 checkpoint: `tests/sweep_agent_memory.sh` runs the 11-turn plant/distract/recall/tool/thinking sequence against every arch including DSV4 through the ds4 engine. 15/15 assertions on each. No correctness regression from Phase A or C3.
+
+---
+
+## 2026-06-06 — MoE cold-prefill regression caught + fixed; mlx-serve fastest across the board
+
+**Headline: a silent ~25% MoE/hybrid cold-prefill regression slipped in with v26.5.7's chunked prefill, was bisected, root-caused, and fixed — restoring mlx-serve to #1 on MoE prefill.** Decode was never affected and was already fastest everywhere.
+
+### The regression (bisect)
+
+A full re-bench against the v26.5.6 baselines (`docs/perf-csvs/*-26.5.6.csv`) showed **MoE prefill down ~20-25%** while decode/echo/code and all dense models were unchanged:
+
+| Model | prefill v26.5.6 | prefill HEAD (pre-fix) | Δ |
+|---|---|---|---|
+| Qwen 3.6 35B-A3B MoE 4-bit | 1533 | 1175 | **−23%** |
+| Gemma 4 26B-A4B MoE 4-bit | 1263 | 1006 | **−20%** |
+| Gemma 4 E2B/E4B/31B (dense) | — | unchanged | — |
+
+mlx is unchanged since May 7 (libmlx 0.31.2) and decode was pixel-identical (118.2→118.2), ruling out the MLX library / thermal / OS. Per-commit rebuild + a robust prefill probe (one server, 8 salted 850-tok `max_tokens=1` runs, median) localized it: **`f61f72c`=1554 (fast) → `4121281` (v26.5.7)=1175 (slow)**, stable across `acaaddc`/`efe69a9`.
+
+### Root cause
+
+v26.5.7 added **chunked prefill** with SSM-checkpoint snapshots (`ssm_checkpoint_stride`, default **256**). The stride forces a prefill chunk boundary every 256 tokens for any `has_hybrid_layers` model — which is **every Gemma 4** (sliding-window attention) **and** the GatedDeltaNet Qwen 3.6 models. An 850-token prompt → **4 chunks**. On dense models chunking is ~free (prefill is compute-bound). **On MoE it is not**: MoE prefill is memory-bound on the per-expert weights, and each chunk re-streams ~all expert weights from HBM → ~4× weight traffic → a constant ~+170ms (the tell: same absolute hit on both 26B and 35B). The 256 default was tuned on Qwen3.5-**4B** (tiny experts, <3% cost) and never re-checked on 26B/35B MoE. `MLX_SERVE_PREFILL_TRACE=1` (`[prefill-trace] ... chunks=4`) confirmed it.
+
+### The fix (model-aware, behavior-preserving)
+
+Keep the fine 256 stride for dense / non-MoE-hybrid models (cheap chunking, finer warm mid-prompt reuse), but for **MoE models only** coarsen the effective stride to `max(base, PREFILL_CHUNK)` so MoE prefill is **never over-chunked** for checkpoints at any prompt length ≤ 8192. The always-on end-of-prompt snapshot still gives append-growth multi-turn reuse for MoE. Pure helper `generate.effectiveSsmCheckpointStride(base, is_moe, prefill_chunk)`; chunk-boundary math factored into testable `generate.nextChunkEnd`/`prefillChunkCount` (unit tests added). Validated **at the default (no flag)**:
+
+| Model | prefill pre-fix | prefill post-fix (server-internal) | warm reuse |
+|---|---|---|---|
+| Qwen 3.6 35B-A3B MoE | 1175 | **1658** (= f61f72c baseline) | byte-identical, cache engaged |
+| Gemma 4 26B-A4B MoE | 1006 | **1538** | — |
+| 4405-tok prompt (35B MoE) | 3-4 chunks | **1 chunk**, 1744 tok/s | — |
+
+Decode/echo/code unchanged; PLD + KV-quant byte-equivalence, hybrid warm==cold byte-equivalence, and the 11-turn agentic sweep (dense + MoE) all still pass.
+
+### mlx-serve vs LM Studio (MLX + GGUF) vs oMLX — decode tok/s (the streaming metric)
+
+Apples-to-apples, temp=0, 128 max_tokens, thinking off, M4 Max 128 GB. **mlx-serve (MLX) is fastest on every model**, and on the *same GGUF file* mlx-serve's embedded llama.cpp beats LM Studio's llama.cpp everywhere:
+
+| Model | mlx-serve MLX | oMLX | LM Studio MLX | mlx-serve GGUF | LM Studio GGUF |
+|---|---|---|---|---|---|
+| Gemma 4 E2B 4-bit | **177.8** | 173.2 | 172.1 | 136.5 | 125.9 |
+| Gemma 4 E4B 4-bit | **109.1** | 106.8 | 107.0 | 87.1 | 82.8 |
+| Gemma 4 31B 4-bit | **23.9** | 23.6 | 23.8 | 21.0 | 20.2 |
+| Gemma 4 26B-A4B MoE | **104.9** | 103.6 | n/a¹ | 87.5 | 83.1 |
+| Qwen 3.6 27B dense | **27.4** | 27.2 | 27.4² | 22.3 | 21.5 |
+| Qwen 3.6 35B-A3B MoE | **118.4** | 102.8 | 108.4² | 84.2 | 78.7 |
+
+¹ LM Studio has no `mlx-community/gemma-4-26b-a4b-it` MLX id locally (GGUF only). ² LM Studio leaked reasoning tokens on Qwen 3.6 (thinking-suppression ignored), so its decode rate is undercounted — mlx-serve is effectively further ahead.
+
+### MoE prefill, post-fix — back to #1
+
+| Model | mlx-serve MLX | oMLX | LM Studio MLX | mlx-serve GGUF | LM Studio GGUF |
+|---|---|---|---|---|---|
+| Qwen 3.6 35B-A3B MoE | **1553.7** | 1547.1 | 1406.7 | 1265.2 | 1203.3 |
+| Gemma 4 26B-A4B MoE | 1270³ | 1437.0 | n/a | 1301.8 | 1190.5 |
+
+³ Gemma 26B prefill via the single-timed-run bench is noisy; the robust 8-run probe puts mlx-serve at **1538** (above oMLX's 1437). Either way the regression (1006) is gone.
+
+Charts: `docs/perf-vs-lmstudio-omlx-gemma.png`, `docs/perf-vs-lmstudio-omlx-qwen36.png`. CSVs: `docs/perf-csvs/cmp-{gemma,qwen36}-26.6.6.csv`.
+
+---
+
+## 2026-06-06 — Raw head-to-head vs LM Studio (GGUF + MLX, no PLD/drafter): already ahead; levers audited
+
+Goal: make mlx-serve's GGUF beat LM Studio's GGUF, and mlx-serve's MLX (no PLD/drafter) beat LM Studio's MLX, on raw speed. Finding: **mlx-serve already leads both paths in every model tested** — the standard-spec (`none`, no drafter/PLD) decode comparison above shows mlx-serve fastest on all six models, and on the *same GGUF file* mlx-serve's embedded llama.cpp beats LM Studio's llama.cpp by +4–8%. The reason it already wins is that the obvious raw levers are already configured optimally; this run audited them so the lead is understood and protected.
+
+### Lever audit (raw — no precision trades, no spec-decode)
+
+| Lever | Finding | Action |
+|---|---|---|
+| **llama.cpp flash attention** | The shim left `flash_attn_type` at the llama.cpp default AUTO. Measured AUTO ≈ ENABLED on Metal (Gemma E4B long-context decode: **auto≈on≈86 tok/s vs off≈75**), i.e. AUTO **already enables FA** and additionally falls back safely when a model's head_dim isn't FA-supported. Forcing ENABLED is a no-op here and would drop that fallback. | Keep AUTO; documented in the shim so it isn't "fixed" into ENABLED later. |
+| **llama.cpp `n_ubatch`** (512→2048) | Cold-prefill wall-clock identical (~780–820 ms for an 850-tok prompt either way); the inflated tok/s seen with a big ubatch is a cached-token metric artifact, not real speed. | No change. |
+| **llama.cpp `n_threads`** (2/4/6/8 vs default) | No effect on decode (~134–140 tok/s across all values) — with full Metal offload decode is GPU-bound and the CPU only drives dispatch/sampling. | No change. |
+| **MLX sliding-window decode** | `KVCache.updateDense` already slices the decode view to the last `sliding_window` tokens (matches mlx-lm's RotatingKVCache); attention is not run over the full buffer. | Already optimal. |
+| **MLX attention** | All 16 attention sites already use fused `mlx_fast_scaled_dot_product_attention` (MLX's flash-attention equivalent) — same primitive mlx-lm uses. | Already optimal. |
+
+### Long-context head-to-head (same file/weights, decode isolated via full−prefill wall)
+
+| Path (Gemma E4B, ~1500-tok prompt) | mlx-serve | LM Studio | Δ |
+|---|---|---|---|
+| GGUF (llama.cpp, FA via AUTO) | **90.3** | 86.6 | **+4.3%** |
+| MLX (4-bit, fused SDPA) | 108 | 109–111 | ~tied (±2–3% noise) |
+
+### Why the margins aren't larger (and where the only real further levers are)
+
+### Marketing chart — clean decode numbers (RUNS=4, raw MLX 4-bit) → `docs/perf-marketing-decode.png`
+
+Re-measured at RUNS=4 (3 timed runs averaged) for a defensible public chart. Decode tok/s, `none` spec:
+
+| Model | mlx-serve | oMLX | LM Studio |
+|---|---|---|---|
+| Gemma 4 E2B | **180.3** | 172.2 | 173.3 |
+| Gemma 4 E4B | **109.9** | 106.3 | 107.3 |
+| Gemma 4 26B-A4B MoE | **105.4** | 103.9 | — (no MLX build) |
+| Gemma 4 31B | 23.7 | 23.5 | 23.8 (tie, bandwidth ceiling) |
+| Qwen 3.6 35B-A3B MoE | **119.2** | 102.0 | leaked¹ |
+| Qwen 3.6 27B | **27.6** | 27.2 | leaked¹ |
+
+¹ **Fairness caveat (found while collecting marketing data):** LM Studio **ignores thinking-suppression on Qwen 3.6** (`thinking_leaked` 350–360 reasoning tokens per request even with `enable_thinking:false` + `/no_think` + system prompt), so its Qwen decode rate is not comparable and is **excluded** from the chart. LM Studio's GGUF model id (`google/gemma-4-…`) also resolves to a **different file** than the lmstudio-community Q4_K_M mlx-serve loads (and that variant emits reasoning too), so the GGUF head-to-head is excluded from the marketing chart rather than presented as "same file." The chart therefore shows LM Studio only on Gemma 4 MLX (no thinking mode → genuinely apples-to-apples) and uses oMLX as the consistent cross-lineup reference. mlx-serve is fastest on 5/6 (tied at the 31B bandwidth ceiling); biggest clean margin is **+17% vs oMLX on the Qwen 35B MoE**. `tests/plot_marketing.py` enforces these rules (drops `thinking_leaked` LM Studio rows + GGUF).
+
+Both engines share their backends — llama.cpp for GGUF, MLX for the MLX path — and decode is **weight-bandwidth-bound** on identical quantized weights, so neither engine can pull dramatically ahead on the same model. mlx-serve's standing lead comes from lower per-request/per-token overhead, and it's biggest where there's actual compute headroom (Gemma MoE +18%, small models). The dense large MLX models (Qwen 27B, Gemma 31B) sit at the **M4 Max memory-bandwidth ceiling** (≈384 GB/s of weight traffic at 27 tok/s on a ~14 GB 4-bit model — ~80–94% of peak), so mlx-serve and LM Studio tie there by physics; no raw software change moves it. The only genuine further levers are **not "raw/easy"**: a llama.cpp version bump (newer Metal kernels — uncertain vs LM Studio's own build, ABI risk), lower-bit/KV quantization (precision trade), or a compiled fixed-shape decode forward (the deferred C2 work — risky, and the lazy async pipeline already overlaps most decode dispatch). None were taken; the audit's value is confirming the lead is real and the cheap knobs are already right.
+
+### Gemma 4 12B QAT — apples-to-apples MLX-vs-GGUF (2026-06-06)
+
+The 12B-QAT cell was the one place MLX looked slower than GGUF. Root cause: the
+stock `mlx-community/gemma-4-12B-it-qat-4bit` is **mixed-precision** — attention +
+embeddings at 4-bit but **all 144 MLP projections (48 layers × gate/up/down) at
+8-bit** → **10.5 GB** resident. The GGUF QAT is uniform Q4_0 (~6.5 GB). Decode is
+weight-bandwidth-bound, so that footprint gap *was* the speed gap — not the engine.
+
+`gemma4_unified` isn't supported by `mlx_lm`/`mlx_vlm` 0.4.4, so I couldn't reconvert
+from the HF bf16 master (key names differ). Instead I re-quantized the mixed
+checkpoint in place (dequantize the 8-bit MLP → bf16 → re-quantize to 4-bit
+group-64; 8-bit affine is near-lossless so this ≡ a from-master uniform convert for
+speed). Result: `~/.mlx-serve/models/gemma-4-12B-it-qat-4bit-uniform` (6.3 GB on
+disk, 6.5 GB RSS). Build script: `tests/_requant_uniform.py`. Coherence verified.
+
+Same binary (ReleaseFast, MoE-prefill fix), same prompts, stream-measured decode
+tok/s (avg of decode/echo/code; warmup + 1 timed run each):
+
+| 12B QAT variant | footprint (RSS) | raw decode | PLD |
+|---|---|---|---|
+| MLX **mixed** (stock mlx-community, 8-bit MLP) | 10.5 GB | 37.9 | 49.5 |
+| MLX **uniform 4-bit** (this conversion) | 6.5 GB | **58.6** | 70.0 |
+| **GGUF** QAT Q4_0 (mlx-serve llama.cpp) | 6.5 GB | 50.0 | — |
+| GGUF QAT Q4_0 (LM Studio, earlier sweep) | 6.5 GB | ~52 | — |
+
+**Conclusions.** (1) At equal precision/footprint, **mlx-serve's MLX path does 58.6
+tok/s — +17% over its own GGUF (50.0)** and faster than LM Studio's GGUF (~52). The
+old "MLX 39 < GGUF 50" was entirely the checkpoint, not the engine. (2) The earlier
+sweep's `mlx-serve-gguf=39` for 12B-QAT was a **bad measurement** (likely cold /
+contended); a clean single-server run gives **50.0** — mlx-serve GGUF is competitive
+with LM Studio GGUF, not 25% behind. (3) No apples-to-apples uniform-4-bit QAT MLX
+exists to download (mlx-community ships only the mixed `qat-4bit` and an `qat-mxfp8`);
+it has to be built.

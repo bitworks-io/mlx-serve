@@ -275,7 +275,7 @@ struct CLILauncherButton: View {
                 Button {
                     detector.launchWithPicker(only, baseURL: baseURL, servedModelId: servedModelId)
                 } label: {
-                    label(for: only)
+                    label(for: only).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .disabled(!isEnabled)
@@ -290,11 +290,14 @@ struct CLILauncherButton: View {
                         }
                     }
                 } label: {
-                    Image(systemName: "terminal")
+                    HStack(spacing: 6) {
+                        Image(systemName: "terminal")
+                        Text("Code")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
-                .fixedSize()
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(
@@ -309,14 +312,16 @@ struct CLILauncherButton: View {
         .task { await detector.refresh() }
     }
 
+    /// Tray launcher label — icon + "Code" so it sits alongside the Chat/Tasks buttons.
     @ViewBuilder
     private func label(for cli: LauncherCLI) -> some View {
-        if cli.useClaudeIcon {
-            ClaudeIcon(size: 12).foregroundStyle(.white)
-        } else if let name = cli.iconSystemName {
-            Image(systemName: name)
-        } else {
-            Text(cli.displayName)
+        HStack(spacing: 6) {
+            if cli.useClaudeIcon {
+                ClaudeIcon(size: 12)
+            } else {
+                Image(systemName: cli.iconSystemName ?? "terminal")
+            }
+            Text("Code")
         }
     }
 }

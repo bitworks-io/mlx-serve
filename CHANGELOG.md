@@ -1,5 +1,19 @@
 # Changelog
 
+## v26.6.6 — Scheduled Tasks: your private, always-on agent
+
+- **Set it and forget it.** A new Tasks window lets you hand your local model a goal — "every weekday at 8am, check my watched sites and write me a briefing" — and it runs unattended in the background, on a schedule or on demand. Everything stays on your Mac: no cloud, no per-run fees, your logged-in browser sessions never leave the machine.
+
+- **Just say when.** Schedule tasks in plain English ("every 15 minutes", "weekdays at 8am", "weekly on Mondays") with one-tap presets, or drop in a cron expression for full control. What you typed is echoed back as a plain confirmation so there's no guesswork.
+
+- **You decide how much it can do.** Pick an autonomy level per task — Read-only, Workspace, Full auto, or YOLO. If a task wants to do something beyond its level, it pauses and sends you a notification you can Approve or Deny right from Notification Center; approve it and the run picks up where it left off, even after a restart.
+
+- **Stay in the loop.** Every run finishes with a notification and a full transcript plus any files it produced, all kept in a per-task history you can scroll back through. Edit a task, run it on demand to test it, or pin it to a specific model — the server starts and switches models automatically when the task fires.
+
+- **Tidier menu bar.** The tray's quick actions are now clearly labelled — Chat, Tasks, and Code — and the browser moved into the app's top menu bar (⇧⌘B) to keep the tray focused.
+
+---
+
 ## v26.6.5 — Voice Mode reliability, agents that finish, dense bf16 Gemma
 
 - **Voice Mode can hear you again.** A code-signing fix grants the app the microphone entitlement it needs under macOS's hardened runtime, so the permission prompt actually appears the first time you say "Hey Loki" — previously mic access was silently denied and Voice Mode never picked up a word. Applied to both local and released/notarized builds.

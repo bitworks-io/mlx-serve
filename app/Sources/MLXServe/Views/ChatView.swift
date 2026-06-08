@@ -326,7 +326,7 @@ struct ChatSidebar: View {
 
     var body: some View {
         List(selection: $appState.activeChatId) {
-            ForEach(appState.chatSessions) { session in
+            ForEach(appState.visibleChatSessions) { session in
                 let isSelected = session.id == appState.activeChatId
                 HStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 2) {

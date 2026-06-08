@@ -54,6 +54,9 @@ set -uo pipefail
 
 # ── Defaults ──
 FAMILY=""
+ONLY=""   # substring filter on the logical target name (e.g. "e2b", "31b"); empty = all
+RAW=0     # when 1, drop the PLD/drafter mlx-serve cells (raw apples-to-apples only)
+THINKING=0 # when 1, enable reasoning on every engine (fair same-workload Qwen comparison)
 RUNS=2
 MAX_TOKENS=128
 CTX=4096
@@ -127,6 +130,9 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --family)     FAMILY="$2"; shift 2 ;;
+        --only)       ONLY="$2"; shift 2 ;;
+        --raw)        RAW=1; shift ;;
+        --thinking)   THINKING=1; shift ;;
         --lmstudio)   INCLUDE_LMSTUDIO=1; shift ;;
         --omlx)       INCLUDE_OMLX=1; shift ;;
         --concurrent) CONCURRENT="$2"; shift 2 ;;
@@ -192,8 +198,10 @@ case "$FAMILY" in
         TARGETS=(
             "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|mlx-community/gemma-4-e2b-it|google/gemma-4-e2b|$DM/gemma-4-E2B-it-assistant-bf16|$GGUF_DIR/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf"
             "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|mlx-community/gemma-4-e4b-it|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16|$GGUF_DIR/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
-            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|mlx-community/gemma-4-31b-it|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16|$GGUF_DIR/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+            "gemma4-12b-4bit|$LMS_DIR/mlx-community/gemma-4-12B-it-4bit|mlx-community/gemma-4-12b-it|google/gemma-4-12b|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf"
+            "gemma4-12b-qat-4bit|$LMS_DIR/mlx-community/gemma-4-12b-it-qat-4bit|mlx-community/gemma-4-12b-it-qat|google/gemma-4-12b-qat|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-QAT-GGUF/gemma-4-12B-it-QAT-Q4_0.gguf"
             "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|mlx-community/gemma-4-26b-a4b-it|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16|$GGUF_DIR/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
+            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|mlx-community/gemma-4-31b-it|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16|$GGUF_DIR/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
         )
         # Specs measured (per row): mlx-serve {none,pld,drafter} + mlx-serve
         # GGUF (none — PLD/drafter are MLX-only and silently no-op on the
@@ -233,6 +241,17 @@ case "$FAMILY" in
         ;;
 esac
 
+# --raw: drop the speculative-decode cells (pld/drafter); keep only the raw
+# apples-to-apples comparison (mlx-serve MLX `none`, mlx-serve GGUF, omlx, LMS).
+if [[ "$RAW" -eq 1 ]]; then
+    _raw_specs=()
+    for _s in "${SPECS[@]}"; do
+        [[ "$_s" == *":pld" || "$_s" == *":drafter" ]] && continue
+        _raw_specs+=("$_s")
+    done
+    SPECS=("${_raw_specs[@]}")
+fi
+
 # ── Test prompts (identical wording across engines so cross-bench numbers compare) ──
 PREFILL_PROMPT="Explain the following topics in extreme detail: $(python3 -c "print(', '.join([f'topic {i} about science and technology and its impact on human civilization throughout history' for i in range(1,50)]))")"
 DECODE_PROMPT="Write a detailed essay about quantum computing"
@@ -267,15 +286,23 @@ def is_palindrome(s: str) -> bool:
 # silently ignores chat_template_kwargs.enable_thinking:false on this family.
 build_body_mlx() {
     local prompt="$1" spec="$2" mt="$3"
-    local epld=false edrft=false
+    local epld=false edrft=false think=false
     [[ "$spec" == "pld" ]]     && epld=true
     [[ "$spec" == "drafter" ]] && edrft=true
-    jq -nc --arg p "$prompt" --argjson mt "$mt" --argjson epld "$epld" --argjson edrft "$edrft" \
-        '{model:"x", messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, enable_thinking:false, enable_pld:$epld, enable_drafter:$edrft}'
+    [[ "$THINKING" == "1" ]]   && think=true
+    jq -nc --arg p "$prompt" --argjson mt "$mt" --argjson epld "$epld" --argjson edrft "$edrft" --argjson think "$think" \
+        '{model:"x", messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, enable_thinking:$think, enable_pld:$epld, enable_drafter:$edrft}'
 }
 
 build_body_lms() {
     local prompt="$1" model="$2" mt="$3"
+    if [[ "$THINKING" == "1" ]]; then
+        # Thinking ON: let LM Studio reason normally (same workload as the other
+        # engines). tok/s is measured over (answer+reasoning)/wall downstream.
+        jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" \
+            '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:true}}'
+        return
+    fi
     if [[ "$LMS_THINKING_WORKAROUND" == "1" ]]; then
         # Thinking-suppression for Qwen 3.6 on LM Studio. The old
         # assistant-prefilled `<think></think>` + continue_final_message trick
@@ -303,8 +330,9 @@ build_body_lms() {
 # oMLX accepts a bare OpenAI-style body; it honors chat_template_kwargs natively.
 build_body_omlx() {
     local prompt="$1" model="$2" mt="$3"
-    jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" \
-        '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:false}}'
+    local think=false; [[ "$THINKING" == "1" ]] && think=true
+    jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" --argjson think "$think" \
+        '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:$think}}'
 }
 
 # ── HTTP helpers ──
@@ -356,7 +384,16 @@ bench_decode() {
     local engine="$1" model="$2" spec="$3" prompt="$4" mt="$5"
     # oMLX routes requests by the basename of the model dir, not the full path.
     local omlx_model_id; omlx_model_id="$(basename "$model")"
-    local elapsed_csv="" last_pt=0 last_ct=0 leaked=0
+    local port
+    case "$engine" in lmstudio) port="$LMS_PORT";; omlx) port="$OMLX_PORT";; *) port="$SERVER_PORT";; esac
+    # Decode rate is measured from the STREAM (tests/_decode_stream.py): it counts
+    # actual content+reasoning delta pieces and times first->last token, so it does
+    # NOT depend on the server's usage/token accounting (LM Studio reports those
+    # inconsistently once reasoning is involved) and it excludes prefill. This is
+    # the only cross-engine-fair way to compare tok/s when some engines emit
+    # reasoning. PLD/drafter accepted tokens stream one delta each, so their
+    # speedup shows up correctly in the rate.
+    local rates=() last_n=0 leaked=0
     for i in $(seq 1 "$RUNS"); do
         local body
         case "$engine" in
@@ -364,21 +401,15 @@ bench_decode() {
             omlx)      body=$(build_body_omlx "$(salted "$i" "$prompt")" "$omlx_model_id" "$mt") ;;
             *)         body=$(build_body_lms  "$(salted "$i" "$prompt")" "$model" "$mt") ;;
         esac
-        IFS='|' read -r elapsed pt ct rt < <(send_one "$engine" "$body")
-        last_pt="$pt"; last_ct="$ct"
-        [[ "$rt" -gt 0 ]] && leaked=$((leaked + rt))
-        if [[ "$i" -gt 1 && "$ct" -gt 0 ]]; then
-            elapsed_csv+="${elapsed},"
-        fi
+        local out; out=$(printf '%s' "$body" | python3 "$SCRIPT_DIR/_decode_stream.py" "http://127.0.0.1:$port/v1/chat/completions" 240)
+        IFS='|' read -r rate ntok rn <<<"$out"
+        last_n="$ntok"; [[ "${rn:-0}" -gt 0 ]] 2>/dev/null && leaked=$((leaked + rn))
+        if [[ "$i" -gt 1 && "$rate" != "ERR" && "$rate" != "0" ]]; then rates+=("$rate"); fi
     done
-    elapsed_csv="${elapsed_csv%,}"
-    if [[ -z "$elapsed_csv" ]]; then echo "0|$last_pt|$last_ct|$leaked"; return; fi
+    if [[ ${#rates[@]} -eq 0 ]]; then echo "0|0|$last_n|$leaked"; return; fi
     python3 -c "
-e=[float(x) for x in '$elapsed_csv'.split(',') if x]
-ct=$last_ct
-avg=sum(e)/len(e)
-tps=ct/(avg/1000.0) if avg>0 and ct>0 else 0
-print(f'{tps:.1f}|$last_pt|$last_ct|$leaked')"
+r=[float(x) for x in '${rates[*]}'.split()]
+print(f'{sum(r)/len(r):.1f}|0|$last_n|$leaked')"
 }
 
 bench_prefill() {
@@ -716,6 +747,7 @@ fi
 
 for row in "${TARGETS[@]}"; do
     IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter mlxserve_gguf_path <<<"$row"
+    [[ -n "$ONLY" && "$logical" != *"$ONLY"* ]] && { echo "SKIP $logical (--only $ONLY)" >&2; continue; }
     [[ -d "$mlxserve_path" ]] || { echo "SKIP missing $mlxserve_path" >&2; continue; }
 
     for spec_entry in "${SPECS[@]}"; do

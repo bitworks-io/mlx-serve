@@ -337,12 +337,23 @@ pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 /// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5
 /// gated-conv). Set to 0 to disable (fall back to pre-Phase-1 behavior:
 /// hybrid models bypass the hot prefix cache entirely). Override via
-/// `--ssm-checkpoint-stride N`. Default 256: measured on M4 with Qwen3.5-4B,
-/// stride 256 keeps cold-prefill overhead under 3% (5 chunks vs 1 for 1k
-/// prompts) while still giving stride-aligned warm reuse to within ~256
-/// tokens of the matched prefix — typically saving 80-95% of multi-turn
-/// prefill compute. Stride 128 gives finer alignment at ~5% cold cost;
-/// stride 512 is essentially zero cold overhead but reuses less.
+/// `--ssm-checkpoint-stride N`.
+///
+/// Default 256. The stride forces a prefill CHUNK boundary at every multiple
+/// (to snapshot SSM/sliding-window state mid-prompt). On dense / non-MoE-hybrid
+/// models (dense Gemma sliding-window, LFM2, Nemotron-H) prefill is
+/// compute-bound, so a fine 256 stride is ~free and buys finer warm mid-prompt
+/// reuse — measured <3% cold cost on Qwen3.5-4B. **MoE models are different**:
+/// their prefill is memory-bound on the per-expert weights, and every extra
+/// chunk re-streams ~all expert weights from HBM, so a fine stride silently
+/// costs ~25% cold prefill on 26B/35B-class MoE (an 850-token prompt = 4
+/// chunks = ~4x expert-weight traffic). To avoid that, the prefill loop
+/// **coarsens this stride to >= PREFILL_CHUNK for MoE models only** (see
+/// `generate.effectiveSsmCheckpointStride`), so MoE prefill is never
+/// over-chunked at any prompt length while non-MoE keeps the fine stride.
+/// The always-on end-of-prompt snapshot preserves append-growth multi-turn
+/// reuse for MoE regardless. Raise this (e.g. 512/1024) to also coarsen the
+/// non-MoE path; set 0 to disable (hybrid models then bypass the hot cache).
 pub var ssm_checkpoint_stride: u32 = 256;
 
 /// Phase 1: cap on the number of checkpoints retained per request. Snapshots

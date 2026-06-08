@@ -8,6 +8,11 @@ struct ChatSession: Identifiable, Codable {
     var updatedAt: Date
     var mode: ChatMode
     var workingDirectory: String?
+    /// Non-nil marks this session as the transient vehicle for an unattended task
+    /// run (see TaskScheduler). Such sessions are filtered out of the chat sidebar
+    /// and never persisted to chat-history.json — their transcript lives under
+    /// ~/.mlx-serve/tasks/<taskId>/<runId>/transcript.json instead.
+    var taskRunId: UUID?
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -17,10 +22,11 @@ struct ChatSession: Identifiable, Codable {
         self.updatedAt = Date()
         self.mode = .chat
         self.workingDirectory = ChatSession.defaultWorkingDirectory
+        self.taskRunId = nil
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, taskRunId
     }
 
     init(from decoder: Decoder) throws {
@@ -31,6 +37,7 @@ struct ChatSession: Identifiable, Codable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         mode = try c.decodeIfPresent(ChatMode.self, forKey: .mode) ?? .chat
+        taskRunId = try c.decodeIfPresent(UUID.self, forKey: .taskRunId)
         // Backfill: sessions saved before workingDirectory had a default come back as nil. Anchor them
         // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
         let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)

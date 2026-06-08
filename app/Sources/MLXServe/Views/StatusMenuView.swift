@@ -149,13 +149,13 @@ struct StatusMenuView: View {
     /// open/close and app restarts. Collapsed by default — these are extras.
     @AppStorage("experimentsExpanded") private var experimentsExpanded = false
     let openChat: () -> Void
-    let openBrowser: () -> Void
     let openModelBrowser: () -> Void
     let openImageGen: () -> Void
     let openVideoGen: () -> Void
     let openAudioGen: () -> Void
     let openSettings: () -> Void
     let openServerLog: () -> Void
+    let openTasks: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -455,7 +455,7 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
-            // Chat, Browser, Claude Code & Quit
+            // Chat, Tasks, Claude Code & Quit
             HStack(spacing: 8) {
                 Button {
                     openChat()
@@ -470,21 +470,16 @@ struct StatusMenuView: View {
                 .disabled(server.status != .running)
 
                 Button {
-                    openBrowser()
+                    openTasks()
                 } label: {
-                    Image(systemName: "globe")
+                    HStack {
+                        Image(systemName: "clock.badge.checkmark")
+                        Text("Tasks")
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .help("Browser")
-
-                Button {
-                    let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
-                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                } label: {
-                    Image(systemName: "folder.badge.gearshape")
-                }
-                .buttonStyle(.bordered)
-                .help("MLX Serve Folder")
+                .help("Scheduled Tasks")
 
                 CLILauncherButton(
                     baseURL: server.baseURL,

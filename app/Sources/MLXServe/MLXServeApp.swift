@@ -70,6 +70,7 @@ struct MLXCoreApp: App {
             case "audioGen": title = "Audio Generation"
             case "settings": title = "Settings"
             case "serverLog": title = "Server Log"
+            case "tasks": title = "Tasks"
             default: title = "Browser"
             }
             NSApplication.shared.windows
@@ -82,13 +83,13 @@ struct MLXCoreApp: App {
         MenuBarExtra {
             StatusMenuView(
                 openChat: { openAndFocus("chat") },
-                openBrowser: { openAndFocus("browser") },
                 openModelBrowser: { openAndFocus("modelBrowser") },
                 openImageGen: { openAndFocus("imageGen") },
                 openVideoGen: { openAndFocus("videoGen") },
                 openAudioGen: { openAndFocus("audioGen") },
                 openSettings: { openAndFocus("settings") },
-                openServerLog: { openAndFocus("serverLog") }
+                openServerLog: { openAndFocus("serverLog") },
+                openTasks: { openAndFocus("tasks") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -101,6 +102,11 @@ struct MLXCoreApp: App {
             MenuBarLabel(idleIcon: menuBarIcon(for: appState.server.status),
                          activeIcon: Self.activeMenuBarIcon,
                          voice: appState.voice)
+                // A tapped task notification deep-links here; open the Tasks window
+                // (the label is always present, so this fires even with no window open).
+                .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
+                    if taskId != nil { openAndFocus("tasks") }
+                }
         }
         .menuBarExtraStyle(.window)
 
@@ -176,8 +182,21 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
         }
         .defaultSize(width: 900, height: 560)
+
+        // Scheduled / on-demand agent tasks — the unattended "claw" surface.
+        Window("Tasks", id: "tasks") {
+            TasksView()
+                .environmentObject(appState)
+                .environmentObject(appState.server)
+                .environmentObject(appState.taskScheduler)
+                .frame(minWidth: 720, minHeight: 480)
+        }
+        .defaultSize(width: 900, height: 620)
         .commands {
             CommandMenu("Agent") {
+                Button("Browser") { openAndFocus("browser") }
+                    .keyboardShortcut("b", modifiers: [.command, .shift])
+
                 Button("Settings…") { openAndFocus("settings") }
                     .keyboardShortcut(",", modifiers: [.command])
 

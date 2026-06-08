@@ -136,10 +136,13 @@ mlx_llama_session *mlx_llama_session_create_kv_quant(mlx_llama_engine *e,
     // already accounted for. Matches `llama-server --swa-full` and addresses
     // llama.cpp issues #19794 / #21831 / #17196 for hybrid/SWA GGUFs.
     cp.swa_full = true;
-    // Flash-attention is required when K/V are quantized — llama.cpp's plain
-    // SDPA path only supports F16/F32 KV. flash_attn defaults vary by version;
-    // turn it on whenever the caller asks for a non-default KV type so we
-    // don't fall over inside llama_decode.
+    // Flash attention. The llama.cpp default is AUTO, which on Metal already
+    // enables FA when beneficial AND safely falls back when a model's head_dim
+    // isn't supported by the FA kernel — measured equivalent to forcing ENABLED
+    // (e.g. Gemma E4B long-context decode: auto≈on≈86 tok/s, off≈75), so we keep
+    // AUTO rather than forcing ENABLED (which would drop the fallback safety).
+    // Quantized K/V is the one case that *requires* FA — the plain SDPA path is
+    // F16/F32 only — so force it on whenever a non-default KV type is requested.
     if (type_k != 0 || type_v != 0) {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }

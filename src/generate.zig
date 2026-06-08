@@ -170,6 +170,85 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
     return tokensPerSec(uncached, prefill_ns);
 }
 
+/// Pick the end position of the next prefill chunk starting at `pos`.
+///
+/// Base behavior: advance by `default_chunk` (the memory-bound `PREFILL_CHUNK`),
+/// clamped to `prefix_len`. When SSM checkpointing is active, shrink the chunk so
+/// it ends exactly on the next `ssm_cp_stride`-aligned ABSOLUTE position — that
+/// lays down a stride-aligned SSM snapshot without changing what the model sees
+/// (attention is causal; SSM/conv update chunk-locally, so the forward result is
+/// identical to an unchunked run).
+///
+/// Pulled out of the prefill loop so the chunk-count behavior is unit-testable:
+/// the stride directly controls how many chunks a cold prefill costs, and on
+/// large MoE/hybrid models each extra chunk re-streams the (huge) expert weights
+/// from HBM — the dominant cold-prefill cost. A too-small stride therefore
+/// silently tanks MoE prefill throughput (~25% on 35B-class models for an
+/// 850-token prompt at stride 256). Keeping typical prompts single-chunk is what
+/// `ssm_checkpoint_stride`'s default guards.
+pub fn nextChunkEnd(
+    pos: usize,
+    prefix_len: usize,
+    default_chunk: usize,
+    want_ssm_cp: bool,
+    ssm_cp_stride: usize,
+    ssm_cp_offset: usize,
+) usize {
+    var end = @min(pos + default_chunk, prefix_len);
+    if (want_ssm_cp and ssm_cp_stride > 0) {
+        const abs_pos = pos + ssm_cp_offset;
+        const abs_end = end + ssm_cp_offset;
+        const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
+        if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
+            end = next_boundary_abs - ssm_cp_offset;
+        }
+    }
+    return end;
+}
+
+/// Effective SSM-checkpoint stride for a model, given the base (configured)
+/// stride and whether the model is MoE.
+///
+/// On dense / non-MoE-hybrid models (dense Gemma sliding-window, LFM2, Nemotron-H)
+/// prefill is compute-bound, so a fine stride is ~free and buys finer warm
+/// mid-prompt reuse — keep the base stride. On MoE models prefill is
+/// memory-bound on the per-expert weights: every checkpoint-induced chunk
+/// re-streams ~all expert weights from HBM (the dominant cold-prefill cost), so
+/// a fine stride silently taxes prefill ~25% on 26B/35B-class MoE. For MoE we
+/// coarsen the stride to at least `prefill_chunk`, so checkpointing never
+/// sub-divides the memory-bound chunk — MoE prefill is then never over-chunked
+/// at any prompt length, while the always-on end-of-prompt snapshot still
+/// provides the dominant append-growth multi-turn reuse. `base == 0`
+/// (checkpointing disabled) is preserved.
+pub fn effectiveSsmCheckpointStride(base: usize, is_moe: bool, prefill_chunk: usize) usize {
+    if (base == 0) return 0;
+    if (is_moe) return @max(base, prefill_chunk);
+    return base;
+}
+
+/// Number of chunks a cold prefill of `prefix_len` tokens splits into for the
+/// given chunk size / SSM-checkpoint stride. Mirrors the loop in `init` exactly
+/// (drives the same `nextChunkEnd`), so a test on this is a faithful proxy for
+/// the real prefill chunk count. Each chunk on a memory-bound MoE prefill
+/// re-streams the expert weights, so this is effectively the cold-prefill
+/// weight-traffic multiplier.
+pub fn prefillChunkCount(
+    prefix_len: usize,
+    default_chunk: usize,
+    want_ssm_cp: bool,
+    ssm_cp_stride: usize,
+    ssm_cp_offset: usize,
+) usize {
+    var pos: usize = 0;
+    var n: usize = 0;
+    while (pos < prefix_len) {
+        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+        pos = end;
+        n += 1;
+    }
+    return n;
+}
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -561,7 +640,12 @@ pub const Generator = struct {
             options.ssm_checkpoint_stride > 0 and
             ctx.ssm_entries != null and
             ctx.ssm_entries.?.len > 0;
-        const ssm_cp_stride: usize = if (want_ssm_cp) @intCast(options.ssm_checkpoint_stride) else 0;
+        // Coarsen the checkpoint stride for MoE so memory-bound expert-weight
+        // re-streaming doesn't tax cold prefill (see effectiveSsmCheckpointStride).
+        const ssm_cp_stride: usize = if (want_ssm_cp)
+            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.moe_layers != null, PREFILL_CHUNK)
+        else
+            0;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
         // scheduler after restoring a checkpoint) pass the matched prefix
         // length so the snapshots stamp positions valid in the full original
@@ -585,15 +669,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                var end = @min(pos + default_chunk, prefix_len);
-                if (want_ssm_cp) {
-                    const abs_pos = pos + ssm_cp_offset;
-                    const abs_end = end + ssm_cp_offset;
-                    const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
-                    if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-                        end = next_boundary_abs - ssm_cp_offset;
-                    }
-                }
+                const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -3661,6 +3737,42 @@ test "isDegenerateTailLoop does not fire on healthy or briefly-repeating output"
     }
     // Too few tokens to judge.
     try testing.expect(!isDegenerateTailLoop(&[_]u32{ 1, 1 }, P, R));
+}
+
+test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
+    const PREFILL_CHUNK: usize = 8192;
+    // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0));
+    // The regression: a fine stride splits an 851-token prefill into 4 chunks
+    // (851 spans boundaries 256/512/768). Harmless on compute-bound dense models
+    // but on a memory-bound MoE prefill each chunk re-streams the expert weights
+    // (~25% slower on 35B-class). The non-MoE path keeps this fine stride.
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0));
+    // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
+    // prefill starting mid-sequence still snaps to global strides. offset=2000,
+    // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
+    // 2048 falls inside (2000..2200) -> 2 chunks.
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000));
+}
+
+test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps fine" {
+    const PREFILL_CHUNK: usize = 8192;
+    // Disabled stays disabled regardless of model type.
+    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, false, PREFILL_CHUNK));
+    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, true, PREFILL_CHUNK));
+    // Non-MoE hybrid keeps the fine base stride (cheap chunking, finer warm reuse).
+    try testing.expectEqual(@as(usize, 256), effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK));
+    // MoE coarsens to at least PREFILL_CHUNK so checkpointing never sub-divides
+    // the memory-bound chunk -> MoE prefill is single-chunk for any prompt the
+    // mem-bound path wouldn't already split.
+    try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK));
+    // A larger explicit stride is respected (never shrunk).
+    try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, true, PREFILL_CHUNK));
+    // End-to-end: with the effective stride, an 851-tok MoE prefill is 1 chunk
+    // (was 4 at the raw 256), while a dense/non-MoE hybrid stays at 4.
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK), 0));
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
