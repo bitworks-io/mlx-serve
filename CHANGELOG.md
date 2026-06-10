@@ -1,5 +1,20 @@
 # Changelog
 
+## v26.6.7 — Agent-grade speed and rock-solid concurrent streaming
+
+- **MacOS 26 Is now required** (issue #21), 
+- **Network GUI Settings** Expose port & bind ip (issue #22)
+- **Support qwen3_moe architecture** (Qwen3-30B-A3B / Coder) (issue #20)
+- **Big prompts tokenize faster.** A rewrite of the BPE tokenizer's merge loop takes a Claude Code-sized system prompt (~30 KB) from 3.9 seconds to 8 milliseconds — every request used to pay that cost, even on a full KV-cache hit. Warm agent turns now round-trip in ~0.1s end to end.
+- **Concurrent streams no longer garble.** When a second request arrived mid-generation, the first stream could emit a duplicated token, drop its tail, and silently corrupt its KV cache — breaking tool-call parsing for agent clients. Fixed, with a byte-equivalence regression test covering mid-stream joins and simultaneous bursts.
+- **The prompt cache survives agent traffic.** Interleaved requests (subagents, title generation, parallel tools) used to evict the long system-prompt prefix on every turn, forcing a full re-prefill. The cache now retains up to 32 conversation roots by default, still bounded by the 2 GB memory budget.
+- **Anthropic API reports cache hits.** `/v1/messages` responses now include `usage.cache_read_input_tokens` (non-streaming and streaming), so Claude Code and Anthropic SDK clients see real prompt-cache savings.
+- **Speculative decoding now works with tools — 2× faster agent edits.** Both PLD and the Gemma 4 assistant drafter used to switch off whenever a request defined tools, which is every Claude Code request. With the gates lifted, file-edit tool calls that echo code back decode at ~2.1× (72 → 150 tok/s measured on Gemma 4 E4B, both modes), with byte-identical output and tool calls. Coverage is now uniform: both modes run on every API surface — Chat Completions, Anthropic Messages, OpenAI Responses, and legacy completions — streaming and non-streaming alike.
+- **Code-completion clients get speculative decoding too.** The legacy `/v1/completions` endpoint (used by FIM / autocomplete tooling) silently ignored `--pld`/`--drafter`; repetitive-code completions now decode at ~1.9× (73 → 139 tok/s). A companion fix keeps the first line's leading indentation intact in non-streaming responses, matching streaming output exactly.
+- **Full API-compliance sweep.** All 112 llmprobe checks across OpenAI Responses, Chat Completions, and Anthropic Messages now pass, including WebSocket transport, streaming parity, and truncation semantics.
+
+---
+
 ## v26.6.6 — Scheduled Tasks: your private, always-on agent
 
 - **Set it and forget it.** A new Tasks window lets you hand your local model a goal — "every weekday at 8am, check my watched sites and write me a briefing" — and it runs unattended in the background, on a schedule or on demand. Everything stays on your Mac: no cloud, no per-run fees, your logged-in browser sessions never leave the machine.

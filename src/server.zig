@@ -316,13 +316,15 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
 }
 
 /// Module-level capacity for plan 03 hot prefix cache. main.zig writes this
-/// from `--prefix-cache-entries N` before calling `serve()`. Default 1 keeps
-/// behavior identical to legacy single-slot.
-// Default capacity 1 mirrors the pre-Phase-A legacy behaviour (single
-// cached prefix, replaced on divergent prompts). Bump to N>1 via
-// `--prefix-cache-entries N` for agent flows that cycle between several
-// conversation roots without thrashing the cache. 0 disables entirely.
-pub var prefix_cache_capacity: u32 = 1;
+/// from `--prefix-cache-entries N` before calling `serve()`.
+// Default 32: agent clients (Claude Code, the app's agent loop) interleave
+// requests from several conversation roots — main thread, subagents, title
+// generation — and a single-entry cache gets its long system-prompt prefix
+// evicted by every interleaved request, forcing a full re-prefill each
+// turn. The count cap is pure retention metadata; the byte budget
+// (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
+// evicting LRU entries by size. 0 disables.
+pub var prefix_cache_capacity: u32 = 32;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -2265,10 +2267,12 @@ fn handleChatCompletions(
         (v == .bool and v.bool)
     else
         server_config.default_enable_pld;
-    if (enable_pld and has_tools) {
-        log.info("  pld=disabled (tools present)\n", .{});
-        enable_pld = false;
-    }
+    // Tools do NOT disable PLD: tool-pattern detection operates on emitted
+    // text and is agnostic to how many tokens a decode step yields, and
+    // agent traffic (tool results echoed into edits) is PLD's best workload.
+    // The original blanket gate predated streaming PLD + scheduler slots;
+    // equivalence with tools is pinned by tests/test_pld_tools.sh.
+    //
     // PLD on hybrid SSM models (LFM2.5, Nemotron-H) works once the SSM
     // snapshot/restore paths handle null ssm_state correctly — see
     // `ssmSnapshot`/`ssmRestore` in transformer.zig.
@@ -2277,10 +2281,11 @@ fn handleChatCompletions(
     // Parse enable_drafter: per-request override of the --drafter default.
     // Auto-disabled when:
     //   - the server didn't load a drafter (`default_drafter == null`)
-    //   - tools are present (multi-token verify ↔ tool-call buffering conflict)
     //   - logprobs are requested (drafter doesn't expose realized log-probs)
     //   - hybrid SSM architecture (same SSM-state issue as PLD; drafter would
     //     hit it on the verify forward).
+    // Tools do NOT disable the drafter (same reasoning as PLD above);
+    // equivalence with tools is pinned by tests/test_drafter_tools.sh.
     // Priority: drafter > PLD > regular. When drafter wins, force PLD off
     // so logs / state stay consistent.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
@@ -2295,10 +2300,6 @@ fn handleChatCompletions(
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) {
         enable_drafter = false; // no drafter loaded; quietly fall through
-    }
-    if (enable_drafter and has_tools) {
-        log.info("  drafter=disabled (tools present)\n", .{});
-        enable_drafter = false;
     }
     if (enable_drafter and logprobs_n > 0) {
         log.info("  drafter=disabled (logprobs requested)\n", .{});
@@ -2584,6 +2585,25 @@ fn handleCompletions(
         break :blk false;
     } else false;
 
+    // Spec-decode flags (mirror chat-completions). FIM / code-completion
+    // prompts are echo-heavy, so the old hardcoded enable_pld/enable_drafter
+    // = false at submit left real speedups unused on this endpoint
+    // (tests/test_completions_spec.sh). Embedded engines (ds4/llama) ignore
+    // these flags at dispatch.
+    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
+    var enable_pld: bool = if (root.get("enable_pld")) |v|
+        (v == .bool and v.bool)
+    else
+        server_config.default_enable_pld;
+    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
+    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
+        (v == .bool and v.bool)
+    else
+        (lm.drafter != null and !config.isMoe());
+    if (enable_drafter and lm.drafter == null) enable_drafter = false;
+    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and enable_pld) enable_pld = false;
+
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
     log.info("POST /v1/completions (max_tokens={d}, temp={d:.2}, top_p={d:.2}, stream={}) \n", .{ max_tokens, temperature, top_p, is_stream });
@@ -2621,6 +2641,23 @@ fn handleCompletions(
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
 
+    // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
+    // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
+    if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
+        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0; // on error, don't gate
+        log.info("  spec-gate: ngram-score={d:.3} (threshold={d:.3})\n", .{ score, spec_gate_threshold });
+        if (score < spec_gate_threshold) {
+            if (enable_pld and !pld_explicit_in_json) {
+                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_pld = false;
+            }
+            if (enable_drafter and !drafter_explicit_in_json) {
+                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_drafter = false;
+            }
+        }
+    }
+
     const eos_slice = config.eosTokenSlice();
     const sampling = generate_mod.SamplingParams{
         .temperature = temperature,
@@ -2632,11 +2669,11 @@ fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2654,10 +2691,16 @@ fn handleNonStreamingCompletion(
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
+    enable_pld: bool,
+    enable_drafter: bool,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, false, getTimeoutNs(), null, 0, null) catch |err| switch (err) {
+    // Spec dispatch (priority drafter > PLD; mirrors handleNonStreamingGeneration).
+    const use_drafter = enable_drafter and lm.drafter != null and sampling.constraint == null;
+    const use_pld = !use_drafter and enable_pld and sampling.constraint == null;
+
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, getTimeoutNs(), null, 0, null) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -2665,7 +2708,15 @@ fn handleNonStreamingCompletion(
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
-    var final_text: []const u8 = result.text;
+    // Text completion is a raw continuation: keep the first token's leading
+    // space (SentencePiece `▁`) instead of the chat-style strip the scheduler
+    // applies — FIM clients rely on exact indentation, and the streaming
+    // handler never stripped it, so this also restores stream/non-stream
+    // parity (tests/test_completions_spec.sh).
+    const raw_text = try decodeTokens(allocator, lm, tok, result.token_ids, false);
+    defer allocator.free(raw_text);
+
+    var final_text: []const u8 = raw_text;
     var finish_reason = result.finish_reason;
     for (stop_sequences) |stop_seq| {
         if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
@@ -2714,10 +2765,17 @@ fn handleStreamingCompletion(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     include_usage: bool,
+    enable_pld: bool,
+    enable_drafter: bool,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
+
+    const config = lm.config.?;
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, lm.drafter != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
+    if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -2733,14 +2791,16 @@ fn handleStreamingCompletion(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = false,
-        .enable_drafter = false,
+        .enable_pld = stream_mode == .pld,
+        .enable_drafter = stream_mode == .drafter,
+        .drafter = if (stream_mode == .drafter) lm.drafter else null,
+        .drafter_block_size = lm.drafter_block_size,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = server_config.default_kv_attn_fused,
         .logprobs_n = 0,
     });
-    var ts = StreamingTokenStream.initFromSlot(slot_handle.?, .regular, eos_token_ids);
+    var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 
     // SSE headers
@@ -5347,15 +5407,14 @@ fn handleAnthropicMessages(
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);
 
-    // Per-request PLD override (mirror chat-completions behavior).
-    // Auto-disable rules: PLD is off with tools / hybrid SSM models.
+    // Per-request PLD override (mirror chat-completions behavior: tools and
+    // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
+    // runtime acceptance gate handle the rest).
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
     var enable_pld: bool = if (root.get("enable_pld")) |v|
         (v == .bool and v.bool)
     else
         server_config.default_enable_pld;
-    if (enable_pld and has_tools) enable_pld = false;
-    if (enable_pld and config.has_hybrid_layers) enable_pld = false;
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
@@ -5365,7 +5424,6 @@ fn handleAnthropicMessages(
     else
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and has_tools) enable_drafter = false;
     if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
 
     // Log request
@@ -5462,7 +5520,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -5485,6 +5543,7 @@ fn handleAnthropicNonStreaming(
     reasoning_budget: i32,
     prompt_token_count: u32,
     enable_pld: bool,
+    enable_drafter: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -5500,9 +5559,11 @@ fn handleAnthropicNonStreaming(
 
     var timer = Stopwatch.init(stream.io);
 
-    // Speculative decoding dispatch — same priority as chat-completions.
+    // Speculative decoding dispatch — same priority as chat-completions
+    // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
-    const use_pld = enable_pld and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_drafter = enable_drafter and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_pld = !use_drafter and enable_pld and sampling.constraint == null;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
@@ -5512,7 +5573,7 @@ fn handleAnthropicNonStreaming(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, false, getTimeoutNs(), slot_ve, 0, kv_quant_override) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, 0, kv_quant_override) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -5649,7 +5710,7 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(timings_field);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
@@ -5657,6 +5718,7 @@ fn handleAnthropicNonStreaming(
         stop_reason,
         prompt_token_count,
         result.completion_tokens,
+        result.cached_tokens,
         timings_field,
     });
     defer allocator.free(response);
@@ -6147,10 +6209,13 @@ fn handleAnthropicStreaming(
         }
 
         // message_delta. Scheduler accounts for any prompt-cache hits in `ts.prompt_tokens`.
+        // cache_read_input_tokens rides here (not message_start) because the
+        // prefix-cache hit count is only known after prefill; clients merge
+        // message_delta usage into the final message per Anthropic semantics.
         {
             const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":null}},"usage":{{"output_tokens":{d}}}}}
-            , .{ stop_reason, ts.completion_tokens });
+                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":null}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
+            , .{ stop_reason, ts.completion_tokens, ts.cached_tokens });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -6774,8 +6839,6 @@ fn handleResponses(
         (v == .bool and v.bool)
     else
         server_config.default_enable_pld;
-    if (enable_pld_resp and active_has_tools) enable_pld_resp = false;
-    if (enable_pld_resp and config.has_hybrid_layers) enable_pld_resp = false;
 
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
@@ -6786,7 +6849,6 @@ fn handleResponses(
     else
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and active_has_tools) enable_drafter_resp = false;
     if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
@@ -7046,16 +7108,17 @@ fn handleResponses(
             .decode_tps = 0.0,
         };
     } else {
-        // Non-streaming Responses: dispatch to PLD when applicable so
+        // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
-        const use_pld = enable_pld_resp and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_drafter = enable_drafter_resp and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_pld = !use_drafter and enable_pld_resp and sampling.constraint == null;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
             const v = local_ve;
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, false, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -8815,3 +8878,13 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
 }
 
+
+test "prefix cache default capacity covers interleaved agent flows" {
+    // Claude Code-style clients interleave several conversation roots (main
+    // thread, subagents, title generation). With capacity 1, every
+    // interleaved request evicted the long system-prompt prefix and forced a
+    // full re-prefill per turn. The byte budget (prefix_cache_mem_bytes)
+    // still bounds memory.
+    try testing.expect(prefix_cache_capacity >= 4);
+    try testing.expect(prefix_cache_mem_bytes > 0);
+}

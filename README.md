@@ -155,7 +155,7 @@ Any quantized MLX model using one of the above architectures works natively. Any
 
 ## Prerequisites
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
+- macOS 26+ with Apple Silicon (M1/M2/M3/M4) — the released app bundles MLX dylibs built for macOS 26; older macOS needs a from-source build against a local mlx
 - [Zig 0.16+](https://ziglang.org/download/) *(only if building from source)*
 - mlx-c and libwebp *(only if building from source)*:
 
@@ -334,7 +334,7 @@ Two flavors, both greedy-equivalent (byte-identical at temp=0 within the first 3
 - **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on (`--pld`); zero per-model setup. Wins on agentic loops, RAG, code editing, anywhere the answer echoes prompt content.
 - **Gemma 4 assistant drafter** — Google's small 4-layer cross-attention drafters (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Opt-in via `--drafter <dir>`. The drafter cross-attends into the target's KV cache — no separate weights duplicated.
 
-Both share an **adaptive prompt-time gate**: a 3-gram repetition score on the prompt (`spec_gate_threshold = 0.01`) auto-disables speculation on novel content, so creative writing and one-shot Q&A run at parity with `--no-pld` instead of paying per-step verify overhead. A **runtime acceptance gate** further disables speculation mid-decode if accept rate falls below break-even (0.30 after 5 attempts). Sticky for the rest of the request.
+Both share an **adaptive prompt-time gate**: a 3-gram repetition score on the prompt (`spec_gate_threshold = 0.01`) auto-disables speculation on novel content, so creative writing and one-shot Q&A run at parity with `--no-pld` instead of paying per-step verify overhead. A **runtime acceptance gate** further disables speculation mid-decode if per-draft acceptance falls below break-even (0.50 after 5 attempts). Sticky for the rest of the request. Both modes apply uniformly across all four API surfaces (chat completions, Anthropic messages, OpenAI responses, legacy completions), streaming and non-streaming, including requests with tools — agentic tool loops are speculative decoding's best workload (~2× on file-edit tool calls).
 
 ### Speedup on the realistic agentic code-edit workload
 
@@ -398,7 +398,7 @@ Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistr
 Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 `<|tool_call>`, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style `tool_calls` deltas in the SSE stream. The MLX Core app ships 10 built-in tools (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.
 
 ### How does it stay this small / fast?
-Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~3.3 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache. Tokenize caching turns the second hit on a long conversation into a memcpy.
+Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~4.5 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache. Tokenize caching turns the second hit on a long conversation into a memcpy.
 
 ### Is the inference exact, or quantized output drift?
 For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with the long-tail divergence inherent to INT4 float-reduction order (documented in `CLAUDE.md`). For temp > 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by `tests/test_pld_equivalence.sh`, `test_drafter_equivalence.sh`, and `test_kv_quant_equivalence.sh`.

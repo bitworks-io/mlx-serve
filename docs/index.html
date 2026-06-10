@@ -31,13 +31,13 @@
     "alternateName": ["MLX Core", "mlx serve"],
     "applicationCategory": "DeveloperApplication",
     "applicationSubCategory": "AI Inference Server",
-    "operatingSystem": "macOS 14+ (Apple Silicon)",
+    "operatingSystem": "macOS 26+ (Apple Silicon)",
     "processorRequirements": "Apple Silicon (M1, M2, M3, M4)",
     "url": "https://ddalcu.github.io/mlx-serve/",
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.5.7",
+    "softwareVersion": "v26.6.7",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -1049,7 +1049,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.5.7</span>
+      <span class="nav-ver">v26.6.7</span>
     </a>
     <ul class="nav-links">
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
@@ -1068,8 +1068,8 @@
   <!-- HERO -->
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
-    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.5.7" class="hero-badge">
-      <span class="new-pill">v26.5.7</span>
+    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.6.7" class="hero-badge">
+      <span class="new-pill">v26.6.7</span>
       Run MLX or GGUF models — faster than LM Studio or Ollama
       <span class="arrow">→</span>
     </a>
@@ -1085,7 +1085,7 @@
       </a>
     </div>
     <div class="hero-meta">
-      <div class="hero-meta-item"><strong>macOS 14+</strong></div>
+      <div class="hero-meta-item"><strong>macOS 26+</strong></div>
       <div class="hero-meta-item"><strong>M1 – M4</strong></div>
       <div class="hero-meta-item"><strong>MIT License</strong></div>
       <a href="https://github.com/ddalcu/mlx-serve/stargazers" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
@@ -1189,14 +1189,14 @@
     <div class="section-header reveal">
       <div class="section-label">Speculative Decoding</div>
       <h2 class="section-title">Two ways to draft ahead</h2>
-      <p class="section-desc">Generate multiple tokens per forward pass, verified exactly — so output is identical, just faster. Smart gates keep it on where it pays and step aside where it doesn't.</p>
+      <p class="section-desc">Generate multiple tokens per forward pass, verified exactly — so output is identical, just faster. Works on every API surface, streaming or not, tools included: agent loops that echo file contents into edits decode at ~2×. Smart gates keep it on where it pays and step aside where it doesn't.</p>
     </div>
     <div class="spec-grid">
       <div class="spec-card reveal">
         <span class="spec-tag pld">PLD</span>
         <h3>Prompt Lookup Decoding</h3>
         <p>Model-agnostic n-gram drafting from the prompt + generated text. Works on every architecture — Gemma, Qwen, Llama, Mistral, Nemotron-H, LFM2.5 — with nothing extra to download.</p>
-        <div class="spec-win">up to <span>1.5×</span> on echo / RAG workloads</div>
+        <div class="spec-win">up to <span>2×</span> on agent tool loops, echo &amp; RAG</div>
       </div>
       <div class="spec-card reveal">
         <span class="spec-tag drafter">DRAFTER</span>
@@ -1229,7 +1229,7 @@
           <svg viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="m23.53 1.02-7.686 3.45h-7.06l-2.98 3.452h7.173L.47 22.98l7.681-3.607h7.065v-.002l2.978-3.45-7.148-.001 12.482-14.9zM0 4.47v14.901h1.883l2.98-3.45H3.451v-8h.942l2.824-3.45H0zm22.117 0-2.98 3.608h1.412v7.844h-.942l-2.98 3.45H24V4.47h-1.883z"/></svg>
         </div>
         <h3>Native, no Python</h3>
-        <p>Written in Zig with direct MLX-C bindings. Eager warmup makes the first request 3.5× faster; a shared-prefix cache skips re-prefilling system prompts across turns.</p>
+        <p>Written in Zig with direct MLX-C bindings. Eager warmup makes the first request 3.5× faster; a rewritten BPE tokenizer chews a 30 KB agent system prompt in 8 ms (was 3.9 s); the prefix cache keeps up to 32 conversation roots warm, so agent turns round-trip in ~0.1 s.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-api">
@@ -1243,7 +1243,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
         </div>
         <h3>Continuous batching</h3>
-        <p><code>--max-concurrent</code> batches multiple decode requests through one forward pass — about 1.6× throughput at 4-way parallel on dense models. A 24-hour soak holds memory drift under 5%.</p>
+        <p><code>--max-concurrent</code> batches multiple decode requests through one forward pass — about 1.6× throughput at 4-way parallel on dense models. Concurrent streams stay byte-identical to solo runs, and a 24-hour soak holds memory drift under 5%.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-kv">
@@ -1289,10 +1289,10 @@
 <span class="cmd">cd</span> mlx-serve
 <span class="cmd">zig build</span> <span class="flag">-Doptimize=ReleaseFast</span>
 
-<span class="comment"># Serve a model — add --pld for speculative decoding</span>
+<span class="comment"># Serve a model — speculative decoding (PLD) is on by default</span>
 <span class="cmd">./zig-out/bin/mlx-serve</span> \
   <span class="flag">--model</span> <span class="string">~/models/gemma-4-e4b-it-4bit</span> \
-  <span class="flag">--serve</span> <span class="flag">--port</span> <span class="string">8080</span> <span class="flag">--pld</span></pre>
+  <span class="flag">--serve</span> <span class="flag">--port</span> <span class="string">8080</span></pre>
         </div>
       </div>
 
@@ -1426,7 +1426,7 @@
       </details>
       <details class="faq-item">
         <summary>How does it stay this small / fast?</summary>
-        <p>Zig with direct <code>mlx-c</code> FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~3.3 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache. Tokenize caching turns the second hit on a long conversation into a memcpy (7.7× warm TTFT on Gemma 4 E4B).</p>
+        <p>Zig with direct <code>mlx-c</code> FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~4.5 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache that survives interleaved subagent traffic; a Claude Code-sized prompt tokenizes in 8 ms, so a warm agent turn round-trips in ~0.1 s end to end.</p>
       </details>
       <details class="faq-item">
         <summary>Is the inference exact, or quantized output drift?</summary>
@@ -1455,7 +1455,7 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.5.7</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.7</span> · built for Apple Silicon</p>
   </footer>
 
   <script>

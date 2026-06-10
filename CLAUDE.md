@@ -51,7 +51,7 @@ CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --ctx-siz
 
 - **ALWAYS build Zig with `-Doptimize=ReleaseFast`. Never use bare `zig build`.** The default optimize mode is Debug, which is 2-4× slower than ReleaseFast for the same workload (e.g. Gemma 4 E4B 4-bit prefill measured at 230 vs 558 tok/s on the same machine — pure build-flag difference, no code change). A Debug binary at `zig-out/bin/mlx-serve` will silently make every benchmark look like a regression. Zig caches incremental builds aggressively, so `-Doptimize=ReleaseFast` is essentially free on rebuild — there is no reason to ever skip it.
 - **Always use `./app/build.sh` for the Swift app, not direct `swift build`** — the script knows the right Swift-version flags, links Zig artifacts, signs the bundle, and keeps `MLXCore` + `mlx-serve` in lockstep. Skip notarization in dev with `SKIP_NOTARIZE=1 bash app/build.sh`.
-- Zig only: `zig build -Doptimize=ReleaseFast` (needs `brew install webp`). **No exceptions** — never bare `zig build` for performance work or for any artifact that ends up in `zig-out/bin/`. A quick way to spot a Debug binary that slipped through: it's ~7-8 MB vs the ~3.3 MB ReleaseFast binary, and `du -h zig-out/bin/mlx-serve` should match `/Applications/MLX Core.app/Contents/MacOS/mlx-serve` in size.
+- Zig only: `zig build -Doptimize=ReleaseFast` (needs `brew install webp`). **No exceptions** — never bare `zig build` for performance work or for any artifact that ends up in `zig-out/bin/`. A quick way to spot a Debug binary that slipped through: it's noticeably larger than the ~4.5 MB ReleaseFast binary (Debug runs ~2× that), and `du -h zig-out/bin/mlx-serve` should match `/Applications/MLX Core.app/Contents/MacOS/mlx-serve` in size.
 - Direct `swift build` (escape hatch only — fast iteration on a Swift-only change): `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5`. Don't ship a build that didn't go through `build.sh`.
 - **Rebuild Jinja** (after `lib/jinja_cpp/*.cpp` changes): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
 
@@ -93,6 +93,10 @@ Existing tools:
 | `LLAMA_GGUF_MODEL=<file.gguf> ./tests/test_llama_gguf.sh [port]` | Embedded llama.cpp GGUF engine end-to-end (auto-routing, chat, streaming, Anthropic) |
 | `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh` | PLD byte-equivalence (default gemma-4-e4b-it-8bit) |
 | `./tests/test_streaming_pld.sh [port]` | Streaming PLD byte-identical to non-streaming |
+| `./tests/test_pld_tools.sh [port]` | PLD with tools present: engages (`[spec-stats] mode=pld`), tool calls + echo text byte-identical to no-PLD baseline (starts its own server) |
+| `./tests/test_drafter_tools.sh [port]` | Drafter with tools present: same contract as test_pld_tools.sh for the Gemma 4 assistant drafter, across chat non-stream, /v1/messages stream + non-stream, and /v1/responses non-stream, with a per-request `[spec-stats]` engagement count — equality checks alone can't catch a dispatch hole because the regular-decode fallback is output-identical (starts its own server) |
+| `./tests/test_completions_spec.sh [port]` | /v1/completions spec-decode: PLD + drafter engage on the FIM endpoint, first-N-token equivalence, stream/non-stream leading-space parity (starts its own server) |
+| `./tests/test_batched_transition.sh [port]` | Concurrent-stream consistency: legacy→batched decode transition must not duplicate/drop tokens (starts its own server) |
 | `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
 | `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
 | `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
@@ -151,7 +155,7 @@ Run `./tests/bench.sh --family <gemma|qwen36>` after major features/optimization
 - Tests at the bottom of each source file (Zig convention)
 - Shell integration tests in `tests/`, need a running server
 - Chat templates live in model dirs; Jinja renders them with fallback formatting
-- Concurrent health checks via threaded connections; single-slot generation
+- Concurrent requests batch-decode together on batchable archs (pure attention); `--max-concurrent` sizes the submit queue, not a decode gate. Slots entering a batch mid-generation drain their lazy pipeline state first (`Generator.drainPipelineForBatch`) — see `tests/test_batched_transition.sh`
 - KV cache reuse via prompt-prefix matching; invalidated after tool calls and pad-only generations
 
 ## Supported Architectures
@@ -292,13 +296,15 @@ Two paths share a verify invariant: `cache.step = prompt_len + tokens_emitted`, 
 
 **`forwardCaptureHidden`**: `forwardStandard` and `forwardMoe` honor `capture_hidden`, slicing post-final-norm hidden at LAST position. Drafter seeds first `h_prev`; PLD uses during partial-accept rollback. Other forward paths (BERT, hybrid) leave it empty — drafter/PLD not wired there.
 
-**Auto-disable**: tools, `logprobs > 0`, grammar-constrained sampling. PLD works on hybrid SSM (LFM2.5, Nemotron-H) — see snapshot null-state guard below. Drafter is non-streaming-only in v1; streaming drafter requests fall through to regular streaming with a log line. Drafter > PLD > regular priority when both enabled.
+**Coverage**: PLD and drafter dispatch on ALL FOUR HTTP surfaces — `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/completions` — in both streaming (`pickStreamMode`) and non-streaming (`nonStreamingViaScheduler` `use_pld`/`use_drafter`) modes. When adding an endpoint or dispatch path, wire BOTH flags through both modes and extend the engagement-count check in `tests/test_drafter_tools.sh` — two non-streaming call sites shipped with a hardcoded `use_drafter=false` for a month because output-equality tests can't see a silent fallback to regular decode.
+
+**Auto-disable**: `logprobs > 0` and grammar-constrained sampling disable both. Tools disable NEITHER — agent traffic (tool results echoed into edits) is spec-decode's best workload; equivalence with tools is pinned by `tests/test_pld_tools.sh` and `tests/test_drafter_tools.sh` (~2.1× decode on file-edit tool calls, Gemma 4 E4B). PLD works on hybrid SSM (LFM2.5, Nemotron-H) — see snapshot null-state guard below; the drafter does not (verify forward hits the SSM-state issue). Drafter streams since spec-decode v3 (`pickStreamMode` routes streaming requests to `.drafter`). Drafter > PLD > regular priority when both enabled.
 
 **Adaptive prompt-time gate** (`spec_gate_threshold = 0.01` in `server.zig`): n-gram repetition score on tokenized prompt (`pld_index.ngramRepeatScore`, 3-grams). If `score < threshold` AND user didn't set `enable_pld:true`/`enable_drafter:true`, the flag is silently disabled. Runs in all three request paths; chat-completions logs `spec-gate: ngram-score=X.XXX` once per request. v4 corpus validation: 9/9 correct decisions; threshold 0.01 cleanly separates "any 3-gram repeats" from pure-novel prompts.
 
 **Runtime acceptance gate** (`RUNTIME_GATE_MIN_PER_DRAFT_RATE = 0.50`, warmup 5): when per-draft acceptance falls below 50% mid-decode, `Generator.spec_disabled_runtime` flips on (sticky). Subsequent calls short-circuit to `Generator.next`, which has a transition shim: when no pending logits/token, sync `forward([next_token_id])` to seed pending_logits. Pre-v26.5.6 the gate compared per-round against 0.30 → almost never fired; 0.50 cleanly cuts creative-content tail (22-47%) while leaving heavy-echo (84-97%) untouched. Does NOT save MoE+drafter regressions where per-draft is high but verify cost dominates — handled by MoE default-off in `serve()`.
 
-**Default-on policy**: PLD/drafter not flipped on at CLI; users still pass `--pld`/`--drafter`. While loaded:
+**Default-on policy**: PLD is ON by default at the CLI (`main.zig` `enable_pld = true`; `--no-pld` disables). The drafter is opt-in via `--drafter <dir>`. While a drafter is loaded:
 - Dense Gemma 4 (E2B/E4B/31B) drafter: `enable_drafter` defaults TRUE per-request; gates handle creative content
 - MoE Gemma 4 (26B-A4B) drafter: `enable_drafter` defaults FALSE — verify forward MoE expert-routing penalty makes drafter regress at batch=1 even at 97.8% per-draft (every block_size tested). PLD remains default-on (1.43× echo). Per-request override still works.
 

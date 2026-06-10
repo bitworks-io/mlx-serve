@@ -2334,6 +2334,10 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
 /// return immediately after the broadcast and call complete()→deinit, so
 /// we cannot reach into the slot afterwards.
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+    // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
+    // The legacy generate() path logs this itself; scheduler-driven slots
+    // finalize here instead.
+    if (slot.legacy_gen) |*g| g.logSpecStats();
     commitSlotIfApplicable(sch, slot);
     slot.markFinished(reason);
 }
@@ -2860,33 +2864,68 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
 
-    // Build inputs.
-    const next_tokens = try allocator.alloc(u32, N);
-    defer allocator.free(next_tokens);
-    const ctxs = try allocator.alloc(*ForwardCtx, N);
-    defer allocator.free(ctxs);
-    const rope_offsets = try allocator.alloc(u32, N);
-    defer allocator.free(rope_offsets);
-
-    for (active, 0..) |slot, i| {
+    // Legacy→batched transition: a slot arriving from a legacy single-slot
+    // tick (or fresh from prefill) carries lazy pipeline state — a lookahead
+    // token ALREADY FORWARDED into its KV cache plus `pending_logits` for
+    // the position after it. Consume that state via `drainPipelineForBatch`
+    // (emit the lookahead, sample the new next_token_id from the pending
+    // logits). Dropping it and re-forwarding `next_token_id` — the pre-fix
+    // behavior — appended a duplicate cache position and re-emitted an
+    // already-emitted token, corrupting any stream whose slot joined a
+    // batch mid-generation (tests/test_batched_transition.sh). Slots that
+    // finish during the drain are excluded from the batch.
+    const live = try allocator.alloc(*Slot, N);
+    defer allocator.free(live);
+    var live_n: usize = 0;
+    for (active) |slot| {
         const gen = if (slot.legacy_gen) |*g| g else {
             slot.markError("no_generator");
-            return error.NoGenerator;
+            continue;
         };
+        if (gen.has_pending_logits or gen.has_pending_token) {
+            const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
+                slot.markError(@errorName(err));
+                continue;
+            };
+            if (emitted) |tok| {
+                slot.pushToken(tok);
+                if (tok != 0) slot.was_pad_only = false;
+                slot.completion_tokens = gen.completion_tokens;
+                if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
+                    finishSlot(sch, slot, "stop");
+                    continue;
+                }
+                if (slot.completion_tokens >= slot.max_tokens) {
+                    finishSlot(sch, slot, "length");
+                    continue;
+                }
+            } else {
+                // checkStop fired on the pipelined lookahead (EOS / pad-run
+                // / max_tokens / timeout); nothing to emit.
+                slot.completion_tokens = gen.completion_tokens;
+                finishSlot(sch, slot, gen.finish_reason);
+                continue;
+            }
+        }
+        live[live_n] = slot;
+        live_n += 1;
+    }
+    if (live_n == 0) return;
+    const batch = live[0..live_n];
+
+    // Build inputs.
+    const next_tokens = try allocator.alloc(u32, live_n);
+    defer allocator.free(next_tokens);
+    const ctxs = try allocator.alloc(*ForwardCtx, live_n);
+    defer allocator.free(ctxs);
+    const rope_offsets = try allocator.alloc(u32, live_n);
+    defer allocator.free(rope_offsets);
+
+    for (batch, 0..) |slot, i| {
+        const gen = &slot.legacy_gen.?;
         next_tokens[i] = gen.next_token_id;
         ctxs[i] = &gen.ctx;
         rope_offsets[i] = @intCast(slot.cache.step);
-        // If the slot still has lazy pipeline state from a previous legacy
-        // tick, drop it — batched path doesn't use it and re-entering legacy
-        // later will sync-forward via the transition shim.
-        if (gen.has_pending_logits) {
-            _ = mlx.mlx_array_free(gen.pending_logits);
-            gen.has_pending_logits = false;
-        }
-        if (gen.has_pending_token) {
-            _ = mlx.mlx_array_free(gen.pending_token);
-            gen.has_pending_token = false;
-        }
     }
 
     const logits_arr = try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
@@ -2896,7 +2935,7 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 
     // Sample per slot, emit prev id, set new next_token_id.
-    for (active, 0..) |slot, i| {
+    for (batch, 0..) |slot, i| {
         if (slot.cancelled.load(.acquire)) continue;
         const gen = &slot.legacy_gen.?;
         const lazy = generate_mod.sampleTokenLazy(logits_arr[i], slot.sampling, xfm_ptr.s);

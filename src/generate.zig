@@ -1071,6 +1071,54 @@ pub const Generator = struct {
         return out;
     }
 
+    /// Legacy→batched transition (scheduler.runBatchedDecodeTick): consume
+    /// the lazy pipeline state so the slot can join a batched tick. The
+    /// legacy pipelined decode keeps a lookahead token ALREADY FORWARDED
+    /// into the KV cache (`pending_token` / `next_token_id`) plus
+    /// `pending_logits` for the position after it. Dropping that state and
+    /// re-forwarding `next_token_id` would append a duplicate position to
+    /// the cache and re-emit an already-emitted token — corrupting every
+    /// stream whose slot enters a batch mid-generation
+    /// (tests/test_batched_transition.sh).
+    ///
+    /// Returns the token to emit this step (the pipelined lookahead), or
+    /// null when generation stopped (`checkStop`: EOS / pad-run /
+    /// max_tokens / timeout — `finish_reason` is set). On return:
+    /// `next_token_id` is sampled but NOT in the cache and pending state is
+    /// empty — exactly the batched-tick entry invariant.
+    pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        try self.resolvePendingToken();
+        if (try self.checkStop()) {
+            if (self.has_pending_logits) {
+                _ = mlx.mlx_array_free(self.pending_logits);
+                self.has_pending_logits = false;
+            }
+            return null;
+        }
+        // Both pipeline shapes (fresh-from-prefill and post-`next()` fast
+        // path) carry pending_logits alongside the in-cache lookahead; a
+        // lookahead without logits would force a re-forward of an in-cache
+        // token, which is the corruption this method exists to prevent.
+        if (!self.has_pending_logits) return error.MissingPendingLogits;
+
+        const token = self.next_token_id;
+        self.completion_tokens += 1;
+        self.step += 1;
+        try self.generated_ids.append(allocator, token);
+        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+
+        const step_logits = self.pending_logits;
+        self.has_pending_logits = false;
+        const lazy = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+        _ = mlx.mlx_array_free(step_logits);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+        _ = mlx.mlx_array_free(lazy);
+        self.next_token_id = @intCast(val);
+        return token;
+    }
+
     /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
     /// This is called at the START of each iteration, giving the GPU maximum time
     /// to compute since the async_eval at the END of the previous iteration.

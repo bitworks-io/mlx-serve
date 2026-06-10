@@ -438,6 +438,42 @@ if [ -n "$MSG_DELTA_LINE" ] && [ -n "$MSG_STOP_LINE" ]; then
 fi
 echo ""
 
+# ── Test: cache_read_input_tokens reported on prefix-cache hits ──
+# Claude Code (and the Anthropic SDK cost displays) read
+# usage.cache_read_input_tokens. The hot prefix cache makes the second
+# identical-prefix request a near-full hit, which must surface in usage on
+# both the non-streaming response and the streaming message_delta.
+echo "=== Cache usage reporting ==="
+CACHE_PROMPT="You are a careful assistant. Here is a long preamble we will reuse verbatim across requests so the server prefix cache gets a long match. The quick brown fox jumps over the lazy dog, again and again, sentence after sentence, to pad this prefix out to a few hundred tokens. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Question: what is 1+1? Reply with just the number."
+CACHE_BODY="{\"model\":\"mlx-serve\",\"max_tokens\":8,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$CACHE_PROMPT\"}]}"
+# warm the cache
+curl -s -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY" > /dev/null
+RESP=$(curl -s -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$CACHE_BODY")
+CACHE_READ=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('usage',{}).get('cache_read_input_tokens',-1))" 2>/dev/null || echo -1)
+assert_gt "non-stream usage.cache_read_input_tokens on repeat prompt" "$CACHE_READ" "0"
+
+STREAM_CACHE_BODY=$(echo "$CACHE_BODY" | python3 -c "import sys,json; b=json.load(sys.stdin); b['stream']=True; print(json.dumps(b))")
+EVENTS=$(curl -s -N -m 60 -X POST "$BASE/v1/messages" -H "Content-Type: application/json" -d "$STREAM_CACHE_BODY")
+STREAM_CACHE_READ=$(echo "$EVENTS" | python3 -c "
+import sys, json
+val = -1
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('data: '):
+        continue
+    try:
+        ev = json.loads(line[6:])
+    except Exception:
+        continue
+    if ev.get('type') == 'message_delta':
+        v = (ev.get('usage') or {}).get('cache_read_input_tokens')
+        if isinstance(v, int):
+            val = v
+print(val)
+")
+assert_gt "streaming message_delta usage.cache_read_input_tokens on repeat prompt" "$STREAM_CACHE_READ" "0"
+echo ""
+
 # ── Summary ──
 echo "=== Summary ==="
 echo -e "Total: $TOTAL  ${GREEN}Passed: $PASS${NC}  ${RED}Failed: $FAIL${NC}"
