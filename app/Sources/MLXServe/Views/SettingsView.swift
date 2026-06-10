@@ -7,9 +7,9 @@ import UniformTypeIdentifiers
 /// UserDefaults.
 ///
 /// Intentionally narrow surface: only the things end-users actually want to
-/// tune. Host / port / request-timeout live in the CLI for power users;
-/// per-request spec-decode overrides duplicate what the Speculative Decoding
-/// toggles already express; "Enable thinking" lives on the chat toolbar.
+/// tune. Request-timeout lives in the CLI for power users; per-request
+/// spec-decode overrides duplicate what the Speculative Decoding toggles
+/// already express; "Enable thinking" lives on the chat toolbar.
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -385,6 +385,27 @@ private struct ServerSectionContent: View {
     }
 
     var body: some View {
+        if let m = meta["host"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.host)
+            ) {
+                TextField(
+                    "",
+                    text: Binding(
+                        get: { appState.serverOptions.host },
+                        set: { appState.serverOptions.host = $0.trimmingCharacters(in: .whitespaces) }
+                    ),
+                    prompt: Text("0.0.0.0")
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.body.monospacedDigit())
+                .multilineTextAlignment(.trailing)
+                .frame(width: 160)
+            }
+        }
+        PortRow()
         ContextSizeRow()
         if let m = meta["noVision"] {
             SettingsRow(
@@ -411,6 +432,50 @@ private struct ServerSectionContent: View {
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(minWidth: 180)
+            }
+        }
+    }
+}
+
+/// Port text field with commit-on-valid semantics. The field edits a local
+/// string so the user can clear it or type through invalid intermediate
+/// states; only values `ServerOptions.parsePort` accepts are committed to
+/// storage. Submitting (or an external change like Reset to Defaults /
+/// Discard) snaps the display back to the last committed value.
+private struct PortRow: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @State private var text: String = ""
+
+    private var isDirty: Bool {
+        guard let last = server.lastLaunchedOptions else { return false }
+        return appState.serverOptions.port != last.port
+    }
+
+    var body: some View {
+        if let m = ServerOptions.serverFlagFields["port"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: isDirty
+            ) {
+                TextField("", text: $text, prompt: Text("11234"))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospacedDigit())
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 90)
+                    .onAppear { text = "\(appState.serverOptions.port)" }
+                    .onChange(of: text) { _, newValue in
+                        if let p = ServerOptions.parsePort(newValue) {
+                            appState.serverOptions.port = p
+                        }
+                    }
+                    .onChange(of: appState.serverOptions.port) { _, newPort in
+                        if ServerOptions.parsePort(text) != newPort {
+                            text = "\(newPort)"
+                        }
+                    }
+                    .onSubmit { text = "\(appState.serverOptions.port)" }
             }
         }
     }

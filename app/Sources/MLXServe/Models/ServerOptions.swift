@@ -193,10 +193,13 @@ struct ServerOptions: Codable, Equatable {
     /// hot-switch). ServerManager passes the parent directory of the
     /// selected model.
     func toCLIArgs(modelDirOverride: String? = nil) -> [String] {
+        // The host field is free text in Settings — a cleared field must not
+        // launch `--host ""` (the server would fail to bind).
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         var args: [String] = [
             "--serve",
             "--port", "\(port)",
-            "--host", host,
+            "--host", trimmedHost.isEmpty ? "0.0.0.0" : trimmedHost,
             "--log-level", logLevel.rawValue,
         ]
         if let dir = modelDirOverride, !dir.isEmpty {
@@ -253,6 +256,21 @@ struct ServerOptions: Codable, Equatable {
         return args
     }
 
+    // MARK: Settings-field validation helpers
+
+    /// Parse the Settings port text field. Accepts exactly what a TCP listen
+    /// can bind: an all-digit string in 1...65535 (after trimming). Returns
+    /// nil for anything else — including 0, which the kernel would map to a
+    /// random ephemeral port the rest of the app isn't watching.
+    static func parsePort(_ raw: String) -> UInt16? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.allSatisfy(\.isNumber),
+              let value = UInt16(trimmed),
+              value > 0 else { return nil }
+        return value
+    }
+
     // MARK: Persistence (UserDefaults JSON)
 
     private static let storageKey = "serverOptions"
@@ -287,7 +305,7 @@ extension ServerOptions {
     static let serverFlagFields: [String: ServerOptionField] = [
         "host": .init(
             title: "Host",
-            explainer: "Bind address. 0.0.0.0 lets other devices on your network reach the server; 127.0.0.1 is local-only.",
+            explainer: "Bind address. 0.0.0.0 lets other devices on your network reach the server; 127.0.0.1 is local-only. The app itself connects via 127.0.0.1, so pick an address that includes localhost.",
             needsRestart: true),
         "port": .init(
             title: "Port",

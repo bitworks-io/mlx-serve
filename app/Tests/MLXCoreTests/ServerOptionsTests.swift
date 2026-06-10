@@ -89,6 +89,43 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--timeout", value: "0"))
     }
 
+    // MARK: - Host / port (Settings UI fields)
+
+    /// `parsePort` backs the Settings port text field — it must accept exactly
+    /// what a TCP listen can bind and reject everything else, because an
+    /// invalid value that slipped through would silently launch on a port the
+    /// rest of the app (health checks, chat client) isn't watching.
+    func testParsePortAcceptsValidPorts() {
+        XCTAssertEqual(ServerOptions.parsePort("11234"), 11234)
+        XCTAssertEqual(ServerOptions.parsePort(" 8080 "), 8080)   // trims whitespace
+        XCTAssertEqual(ServerOptions.parsePort("1"), 1)
+        XCTAssertEqual(ServerOptions.parsePort("65535"), 65535)
+    }
+
+    func testParsePortRejectsJunk() {
+        XCTAssertNil(ServerOptions.parsePort(""))
+        XCTAssertNil(ServerOptions.parsePort("0"))      // 0 = kernel-assigned ephemeral; client couldn't find the server
+        XCTAssertNil(ServerOptions.parsePort("65536"))
+        XCTAssertNil(ServerOptions.parsePort("-1"))
+        XCTAssertNil(ServerOptions.parsePort("80x"))
+        XCTAssertNil(ServerOptions.parsePort("abc"))
+        XCTAssertNil(ServerOptions.parsePort("11 234"))
+    }
+
+    /// The host field is free text in Settings; a cleared field must not
+    /// launch `--host ""` (the server would fail to bind).
+    func testEmptyHostFallsBackToBindAll() {
+        var opts = ServerOptions()
+        opts.host = "   "
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--host", value: "0.0.0.0"))
+    }
+
+    func testCustomHostIsEmitted() {
+        var opts = ServerOptions()
+        opts.host = "127.0.0.1"
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--host", value: "127.0.0.1"))
+    }
+
     func testNoVisionFlag() {
         var opts = ServerOptions()
         opts.noVision = true
