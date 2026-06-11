@@ -2407,6 +2407,20 @@ fn handleChatCompletions(
         log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
+    // Qwen native MTP head: defaults ON whenever the model loaded one (the
+    // sidecar only loads when it binds to this trunk; MoE mirrors the
+    // drafter caution). Priority MTP > drafter > PLD at dispatch. NOT
+    // subject to the n-gram spec gate below — the trained head holds ~73%
+    // per-draft acceptance even on fully novel content.
+    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        (lm.mtp != null and !config.isMoe());
+    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+    if (enable_mtp and logprobs_n > 0) {
+        log.info("  mtp=disabled (logprobs requested)\n", .{});
+        enable_mtp = false;
+    }
     if (enable_drafter) {
         if (enable_pld) {
             log.info("  pld=disabled (drafter takes priority for this request)\n", .{});
@@ -2557,7 +2571,7 @@ fn handleChatCompletions(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -2568,7 +2582,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2687,6 +2701,11 @@ fn handleCompletions(
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
+    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        (lm.mtp != null and !config.isMoe());
+    if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
@@ -2753,11 +2772,11 @@ fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2777,14 +2796,16 @@ fn handleNonStreamingCompletion(
     model_name: []const u8,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
-    // Spec dispatch (priority drafter > PLD; mirrors handleNonStreamingGeneration).
-    const use_drafter = enable_drafter and lm.drafter != null and sampling.constraint == null;
-    const use_pld = !use_drafter and enable_pld and sampling.constraint == null;
+    // Spec dispatch (priority MTP > drafter > PLD; mirrors handleNonStreamingGeneration).
+    const use_mtp = enable_mtp and lm.mtp != null and sampling.constraint == null;
+    const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null;
+    const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, getTimeoutNs(), null, 0, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -2851,15 +2872,17 @@ fn handleStreamingCompletion(
     include_usage: bool,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, lm.drafter != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
+    if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -2879,6 +2902,9 @@ fn handleStreamingCompletion(
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .drafter_block_size = lm.drafter_block_size,
+        .enable_mtp = stream_mode == .mtp,
+        .mtp = if (stream_mode == .mtp) lm.mtp else null,
+        .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = server_config.default_kv_attn_fused,
@@ -3049,6 +3075,7 @@ fn nonStreamingViaScheduler(
     has_tools: bool,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
     logprobs_n: u32,
@@ -3073,6 +3100,9 @@ fn nonStreamingViaScheduler(
         .enable_drafter = enable_drafter and lm.drafter != null,
         .drafter = if (enable_drafter) lm.drafter else null,
         .drafter_block_size = lm.drafter_block_size,
+        .enable_mtp = enable_mtp and lm.mtp != null,
+        .mtp = if (enable_mtp) lm.mtp else null,
+        .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = server_config.default_kv_attn_fused,
@@ -3159,6 +3189,7 @@ fn handleNonStreamingGeneration(
     reasoning_budget: i32,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -3180,8 +3211,9 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const use_drafter = enable_drafter and logprobs_n == 0 and lm.drafter != null and sampling.constraint == null;
-    const use_pld = !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const use_mtp = enable_mtp and logprobs_n == 0 and lm.mtp != null and sampling.constraint == null;
+    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and lm.drafter != null and sampling.constraint == null;
+    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
     // Transfer vision ownership into the slot via the scheduler.
     const slot_ve: ?mlx.mlx_array = blk: {
@@ -3189,7 +3221,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -3421,7 +3453,7 @@ fn handleNonStreamingGeneration(
 /// `pld_drop_buf` is a heap-owned pending buffer (PLD can yield up to
 /// `1+max_draft_len`=16 tokens per step; drafter yields up to `block_size`).
 /// Caller must `deinit`.
-const StreamMode = enum { regular, pld, drafter };
+const StreamMode = enum { regular, pld, drafter, mtp };
 /// Source of streamed tokens. Either a legacy Generator (single-slot mlx on
 /// the calling thread) or a Scheduler Slot (mlx on the scheduler's inference
 /// thread, this thread reads via waitNext). `next()` yields one token id at
@@ -3595,6 +3627,36 @@ const StreamingTokenStream = struct {
                 }
                 return first_tok;
             },
+            .mtp => {
+                // Mirror the drafter branch — `nextMtp` returns the same
+                // `{tokens, accepted_tokens}` shape.
+                const r = (try gen.nextMtp(allocator)) orelse return null;
+                defer allocator.free(r.tokens);
+                if (r.tokens.len == 0) {
+                    self.finished = true;
+                    return null;
+                }
+                var first_idx: usize = 0;
+                while (first_idx < r.tokens.len and generate_mod.isEosId(r.tokens[first_idx], self.eos_token_ids)) : (first_idx += 1) {}
+                if (first_idx >= r.tokens.len) {
+                    gen.done = true;
+                    gen.finish_reason = "stop";
+                    self.finished = true;
+                    return null;
+                }
+                const first_tok = r.tokens[first_idx];
+                var i: usize = first_idx + 1;
+                while (i < r.tokens.len) : (i += 1) {
+                    if (generate_mod.isEosId(r.tokens[i], self.eos_token_ids)) {
+                        gen.done = true;
+                        gen.finish_reason = "stop";
+                        self.finished = true;
+                        break;
+                    }
+                    try self.pending_buf.append(allocator, r.tokens[i]);
+                }
+                return first_tok;
+            },
             .drafter => {
                 // Mirror the PLD branch — `nextDrafter` returns the same
                 // `{tokens, accepted_tokens}` shape (full accept yields
@@ -3644,11 +3706,17 @@ const StreamingTokenStream = struct {
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
     drafter_loaded: bool,
+    mtp_loaded: bool,
     has_hybrid_layers: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
+    // Priority: MTP > drafter > PLD. The MTP head only loads when it binds
+    // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
+    // it needs is the same one PLD uses.
+    if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
     if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .drafter;
     if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
     return .regular;
@@ -3675,6 +3743,7 @@ fn handleStreamingGeneration(
     reasoning_budget: i32,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -3702,9 +3771,10 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, lm.drafter != null, config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
+    if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
     // Scheduler's inference thread runs prefill + per-tick decode (regular
     // / PLD / drafter) and pushes generated tokens into the slot's output
@@ -3731,6 +3801,9 @@ fn handleStreamingGeneration(
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .drafter_block_size = lm.drafter_block_size,
+        .enable_mtp = stream_mode == .mtp,
+        .mtp = if (stream_mode == .mtp) lm.mtp else null,
+        .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = server_config.default_kv_attn_fused,
@@ -5644,6 +5717,11 @@ fn handleAnthropicMessages(
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        (lm.mtp != null and !config.isMoe());
+    if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -5730,7 +5808,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -5739,7 +5817,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -5766,6 +5844,7 @@ fn handleAnthropicNonStreaming(
     prompt_token_count: u32,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -5784,8 +5863,9 @@ fn handleAnthropicNonStreaming(
     // Speculative decoding dispatch — same priority as chat-completions
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
-    const use_drafter = enable_drafter and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
-    const use_pld = !use_drafter and enable_pld and sampling.constraint == null;
+    const use_mtp = enable_mtp and lm.mtp != null and sampling.constraint == null;
+    const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
@@ -5795,7 +5875,7 @@ fn handleAnthropicNonStreaming(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, 0, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, 0, kv_quant_override, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -5975,6 +6055,7 @@ fn handleAnthropicStreaming(
     prompt_token_count: u32,
     enable_pld: bool,
     enable_drafter: bool,
+    enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -5994,9 +6075,10 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, lm.drafter != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
+    if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -6019,6 +6101,9 @@ fn handleAnthropicStreaming(
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .drafter_block_size = lm.drafter_block_size,
+        .enable_mtp = stream_mode == .mtp,
+        .mtp = if (stream_mode == .mtp) lm.mtp else null,
+        .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = server_config.default_kv_attn_fused,
@@ -7190,6 +7275,11 @@ fn handleResponses(
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null) enable_drafter_resp = false;
     if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
+    var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        (lm.mtp != null and !config.isMoe());
+    if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -7211,9 +7301,10 @@ fn handleResponses(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, lm.drafter != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
+        if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
 
         var slot_handle: ?*scheduler_mod.Slot = null;
         defer if (slot_handle) |s| global_scheduler.?.complete(s);
@@ -7236,6 +7327,9 @@ fn handleResponses(
             .enable_drafter = stream_mode == .drafter,
             .drafter = if (stream_mode == .drafter) lm.drafter else null,
             .drafter_block_size = lm.drafter_block_size,
+            .enable_mtp = stream_mode == .mtp,
+            .mtp = if (stream_mode == .mtp) lm.mtp else null,
+            .mtp_depth = lm.mtp_depth,
             .vision_embeddings = slot_ve_resp,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
@@ -7473,15 +7567,16 @@ fn handleResponses(
     } else {
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
-        const use_drafter = enable_drafter_resp and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
-        const use_pld = !use_drafter and enable_pld_resp and sampling.constraint == null;
+        const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
+        const use_drafter = !use_mtp and enable_drafter_resp and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
             const v = local_ve;
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };

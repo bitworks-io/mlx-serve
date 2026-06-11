@@ -1302,6 +1302,11 @@ pub const ForwardCtx = struct {
     moe_seq_offset: *usize,
     ssm_entries: ?[]SSMCacheEntry,
     capture_hidden: ?*mlx.mlx_array,
+    /// Like `capture_hidden` but receives the FULL post-final-norm hidden
+    /// `[B, L, H]` (all positions, refcount-shared) instead of the last
+    /// position only. Used by the Qwen MTP head, whose committed-history
+    /// cache needs the trunk hidden at every verify/prefill position.
+    capture_hidden_all: ?*mlx.mlx_array = null,
     vision_embeddings: ?mlx.mlx_array,
     /// Phase 2 (Plan ricky): when true, attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
@@ -2944,6 +2949,28 @@ pub const Transformer = struct {
         return self.forwardWith(ctx, token_ids);
     }
 
+    /// Like `forwardWithCapture` but ALSO captures the full `[B, L, H]`
+    /// post-final-norm hidden (all positions) into `out_hidden_all`. The MTP
+    /// verify forward needs the last-position hidden (next round's h_prev)
+    /// and every position's hidden (committed-history re-append) in one pass.
+    pub fn forwardWithCaptureAll(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        token_ids: mlx.mlx_array,
+        out_hidden: *mlx.mlx_array,
+        out_hidden_all: *mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const saved = ctx.capture_hidden;
+        const saved_all = ctx.capture_hidden_all;
+        ctx.capture_hidden = out_hidden;
+        ctx.capture_hidden_all = out_hidden_all;
+        defer {
+            ctx.capture_hidden = saved;
+            ctx.capture_hidden_all = saved_all;
+        }
+        return self.forwardWith(ctx, token_ids);
+    }
+
     // ── BERT encoder-only forward pass ──
 
     fn bertEmbedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
@@ -3629,6 +3656,9 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_set(target, sliced);
             _ = mlx.mlx_array_free(sliced);
         }
+        if (ctx.capture_hidden_all) |target_all| {
+            _ = mlx.mlx_array_set(target_all, final_normed);
+        }
 
         if (self.embedding_mode) return final_normed;
         var logits = try self.lmHeadProject(final_normed);
@@ -4224,6 +4254,9 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_slice(&sliced, final_normed, &start, 3, &stop, 3, &strides, 3, self.s));
             _ = mlx.mlx_array_set(target, sliced);
             _ = mlx.mlx_array_free(sliced);
+        }
+        if (ctx.capture_hidden_all) |target_all| {
+            _ = mlx.mlx_array_set(target_all, final_normed);
         }
 
         if (self.embedding_mode) return final_normed;

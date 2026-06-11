@@ -19,6 +19,7 @@ test {
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
     _ = @import("drafter.zig");
+    _ = @import("mtp.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("model_discovery.zig");

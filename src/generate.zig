@@ -10,6 +10,7 @@ const token_mask = @import("token_mask.zig");
 const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const drafter_mod = @import("drafter.zig");
+const mtp_mod = @import("mtp.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -21,6 +22,7 @@ const ssmRestore = transformer_mod.ssmRestore;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
+const KVCache = transformer_mod.KVCache;
 
 /// Module-level overrides for prefill behavior. Defaults match the original
 /// hardcoded values; main.zig may overwrite these from CLI flags before
@@ -332,6 +334,33 @@ pub const Generator = struct {
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     drafter_accepted_tokens: u64 = 0,
 
+    // ── Qwen native MTP head state ──
+    // The model's own one-layer multi-token-prediction head (src/mtp.zig).
+    // When `mtp != null`, callers use `nextMtp` instead of `next`. The head
+    // is owned by the server (loaded with the model); the Generator only
+    // holds a non-owning pointer. `mtp_cache` is the head's committed-history
+    // KV cache — OWNED by the Generator (built during prefill, freed in
+    // `deinit`).
+    mtp: ?*mtp_mod.MtpModel = null,
+    mtp_cache: ?KVCache = null,
+    /// CONFIGURED max tokens drafted per round (verify length = depth + 1).
+    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
+    /// CURRENT adaptive depth (see updateMtpDepth). Starts at `mtp_depth`,
+    /// demoted/promoted per windowed acceptance, never exceeds `mtp_depth`.
+    mtp_depth_current: u32 = mtp_mod.DEFAULT_DEPTH,
+    /// Stats: count of nextMtp calls that ran a verify forward.
+    mtp_attempted: u64 = 0,
+    /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
+    mtp_accepted_tokens: u64 = 0,
+    /// Adaptive-depth moving window: per-round drafted/accepted counts.
+    mtp_window_drafted: [MTP_DEPTH_WINDOW]u8 = [_]u8{0} ** MTP_DEPTH_WINDOW,
+    mtp_window_accepted: [MTP_DEPTH_WINDOW]u8 = [_]u8{0} ** MTP_DEPTH_WINDOW,
+    mtp_window_idx: u32 = 0,
+    mtp_rounds_since_switch: u32 = 0,
+    /// Rounds remaining during which promotion is blocked (set after a
+    /// demotion so a failed depth excursion isn't immediately retried).
+    mtp_promote_cooldown: u32 = 0,
+
     // ── Phase 1: SSM checkpoints captured during prefill ──
     /// Owned SSM-state snapshots taken at stride-aligned positions during
     /// chunked prefill. Drained by the scheduler in `commitSlotIfApplicable`
@@ -481,6 +510,28 @@ pub const Generator = struct {
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
     pub fn logSpecStats(self: *const Generator) void {
+        if (self.mtp != null and self.mtp_attempted > 0) {
+            const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
+                @as(f64, @floatFromInt(self.mtp_attempted));
+            const drafts_proposed: u64 = self.mtp_attempted * @as(u64, self.mtp_depth);
+            const per_draft_pct: f64 = if (drafts_proposed > 0)
+                100.0 * @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
+                    @as(f64, @floatFromInt(drafts_proposed))
+            else
+                0.0;
+            log.info(
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} runtime_disabled={s}\n",
+                .{
+                    self.mtp_attempted,
+                    self.mtp_accepted_tokens,
+                    avg_per_round,
+                    per_draft_pct,
+                    self.mtp_depth,
+                    if (self.spec_disabled_runtime) "true" else "false",
+                },
+            );
+            return;
+        }
         if (self.drafter != null and self.drafter_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.drafter_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.drafter_attempted));
@@ -557,6 +608,16 @@ pub const Generator = struct {
         /// Number of tokens per draft round. Default 4 (3 drafter steps +
         /// 1 t1 prepend → length-4 verify forward).
         drafter_block_size: u32 = 4,
+        /// Enable the Qwen native MTP head. When set, `mtp` must be non-null
+        /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
+        /// history KV cache chunk-by-chunk (full-hidden capture) and the
+        /// final-token forward captures `last_hidden`, exactly like the
+        /// drafter path. Same lazy-pre-forward skip semantics as PLD/drafter.
+        mtp_enabled: bool = false,
+        /// Non-owning pointer to the loaded MTP head.
+        mtp: ?*mtp_mod.MtpModel = null,
+        /// Tokens drafted per nextMtp round.
+        mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
         /// When set, this slice (rather than `prompt_ids`) becomes the
         /// `prompt_ids_owned` source for PLD's n-gram lookup. Used by the
         /// server's KV-cache-reuse path to forward only the trailing tokens
@@ -716,6 +777,16 @@ pub const Generator = struct {
         // sequence, not relative offsets inside the tail-only prefill.
         const ssm_cp_offset: usize = options.ssm_checkpoint_pos_offset;
 
+        // Qwen native MTP: build the head's committed-history KV cache during
+        // prefill. Entry j pairs (trunk hidden at prompt position j, token at
+        // j+1); the (hidden[last], t1) pair is appended by the first nextMtp
+        // round. On KV-prefix reuse the history covers only the freshly
+        // forwarded tail — RoPE offsets are cache-relative, so a late-starting
+        // history is self-consistent (sliding-window history semantics).
+        const mtp_active = options.mtp_enabled and options.mtp != null;
+        var mtp_cache: ?KVCache = if (mtp_active) try options.mtp.?.makeCache(allocator) else null;
+        errdefer if (mtp_cache) |*mc| mc.deinit();
+
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const has_vision = ctx.vision_embeddings != null;
@@ -764,16 +835,37 @@ pub const Generator = struct {
                     break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
                         ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
                 };
+                var chunk_hidden_all = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(chunk_hidden_all);
                 const chunk_logits = if (xfm.compiled_forward != null and
+                    !mtp_active and
                     ctx.cache == &xfm.cache and
                     ssm_match and
                     ctx.capture_hidden == null and
                     ctx.vision_embeddings == null)
                     try xfm.forwardCompiled(chunk_input)
-                else
-                    try xfm.forwardWith(&ctx, chunk_input);
+                else if (mtp_active) blk: {
+                    var last_unused = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(last_unused);
+                    break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
+                } else try xfm.forwardWith(&ctx, chunk_input);
                 _ = mlx.mlx_array_free(chunk_logits);
                 if (trace_enabled) chunked_ns += prefill_sw.read() - chunk_start_ns;
+
+                // MTP history for this chunk: hiddens [pos, end) pair with
+                // tokens [pos+1, end+1) — prompt_ids[end] always exists since
+                // the chunk loop spans [0, prefix_len) and prompt_ids has
+                // prefix_len + 1 entries.
+                if (mtp_active) {
+                    try mtp_mod.appendHistory(
+                        options.mtp.?,
+                        xfm,
+                        &mtp_cache.?,
+                        prompt_ids[pos + 1 .. end + 1],
+                        chunk_hidden_all,
+                        @intCast(mtp_cache.?.step),
+                    );
+                }
 
                 // Eval KV cache — materializes this chunk's K/V, frees activation graph
                 const eval_start_ns = if (trace_enabled) prefill_sw.read() else 0;
@@ -784,6 +876,16 @@ pub const Generator = struct {
                         if (!entry.initialized) continue;
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                    }
+                    // Materialize this chunk's MTP history entries alongside
+                    // the trunk KV so the chunk's activation graph (incl. the
+                    // full-hidden capture) can be freed before the next chunk.
+                    if (mtp_cache) |*mc| {
+                        for (mc.entries) |*entry| {
+                            if (!entry.initialized) continue;
+                            _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                            _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                        }
                     }
                     // Phase 1: also force SSM state to materialize so the
                     // snapshot we take below holds a concrete tensor, not a
@@ -881,7 +983,7 @@ pub const Generator = struct {
         // forward at the start of `nextDrafter`.
         const drafter_active = options.drafter_enabled and options.drafter != null;
         const pld_active = options.pld_enabled;
-        const need_capture = drafter_active;
+        const need_capture = drafter_active or mtp_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
         const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
@@ -928,6 +1030,12 @@ pub const Generator = struct {
         // sample the first token until we have applied the grammar mask, and we
         // cannot pipeline because grammar advancement depends on the realized id.
         if (sampling.constraint != null) {
+            // Grammar-constrained requests never speculate; release the MTP
+            // history cache if dispatch enabled it anyway.
+            if (mtp_cache) |*mc| {
+                mc.deinit();
+                mtp_cache = null;
+            }
             var gen = Generator{
                 .xfm = xfm,
                 .ctx = ctx,
@@ -955,12 +1063,13 @@ pub const Generator = struct {
             return gen;
         }
 
-        // Drafter / PLD-v2 path: sample synchronously and DO NOT pre-forward
-        // the sampled token. The first nextDrafter / nextPld call needs the
-        // cache at exactly prompt_len (last prompt token forwarded; first
-        // sampled token deferred). The lazy pre-forward path below would
-        // over-advance the cache and corrupt every verify forward.
-        if (drafter_active or pld_active) {
+        // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
+        // pre-forward the sampled token. The first nextDrafter / nextPld /
+        // nextMtp call needs the cache at exactly prompt_len (last prompt
+        // token forwarded; first sampled token deferred). The lazy
+        // pre-forward path below would over-advance the cache and corrupt
+        // every verify forward.
+        if (drafter_active or pld_active or mtp_active) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -991,10 +1100,18 @@ pub const Generator = struct {
                 .prompt_ids_alloc = allocator,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
+                .mtp = if (mtp_active) options.mtp else null,
+                .mtp_cache = mtp_cache,
+                .mtp_depth = options.mtp_depth,
+                // Start at depth 1 and climb with evidence: the cheap depth
+                // is the safe default (1.11x on cold/creative content), and
+                // hot workloads promote within ~8 rounds.
+                .mtp_depth_current = @min(1, options.mtp_depth),
             };
+            mtp_cache = null; // ownership transferred to the Generator
             // pending_logits/pending_token left empty — the lazy pipeline is
-            // skipped under PLD / drafter. The speculative `next*` paths drive
-            // every subsequent step with predictable cache offset.
+            // skipped under PLD / drafter / MTP. The speculative `next*` paths
+            // drive every subsequent step with predictable cache offset.
             attachCp(&gen, &ssm_checkpoints, allocator);
             return gen;
         }
@@ -1109,6 +1226,10 @@ pub const Generator = struct {
             a.free(self.prompt_ids_owned);
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
+        }
+        if (self.mtp_cache) |*mc| {
+            mc.deinit();
+            self.mtp_cache = null;
         }
         // Free any SSM checkpoints the caller didn't claim. Each layer-slice
         // was allocated by `ssm_checkpoint_alloc` (= the allocator passed to
@@ -2107,6 +2228,416 @@ pub const Generator = struct {
         self.spec_disabled_runtime = true;
     }
 
+    /// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
+    /// (same verify invariant: cache.step = prompt_len + emitted, t1 NOT in
+    /// cache on entry, verify input `[t1, draft[0..m-1]]`, bonus from row m,
+    /// partial-accept snapshot/restore + re-forward) with one addition: the
+    /// MTP head's committed-history KV cache. Draft steps append m temporary
+    /// entries built from MTP-PREDICTED hiddens; after the verify decision we
+    /// restore the round-boundary snapshot and re-append the committed pairs
+    /// from TRUE trunk hiddens, so the history never accumulates drift.
+    pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done) return null;
+        std.debug.assert(self.mtp != null);
+        std.debug.assert(self.mtp_cache != null);
+        std.debug.assert(self.has_last_hidden);
+        std.debug.assert(self.sampling.constraint == null); // grammar + MTP unsupported
+        std.debug.assert(self.logprobs_n == 0); // logprobs + MTP unsupported
+
+        // Runtime acceptance gate: same hand-off contract as the drafter
+        // (`next()`'s transition shim seeds pending_logits).
+        if (self.spec_disabled_runtime) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return DrafterStepResult{
+                .tokens = tokens,
+                .accepted_tokens = 0,
+            };
+        }
+
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const head = self.mtp.?;
+        const mc = &self.mtp_cache.?;
+        const m: u32 = @max(@as(u32, 1), self.mtp_depth_current);
+        const t1: u32 = self.next_token_id;
+
+        // ── Phase 0: snapshot the MTP history at the round boundary ──
+        const mtp_off0: usize = mc.step;
+        var mtp_snap = try mc.snapshot();
+        defer mtp_snap.deinit();
+
+        // ── Phase 1: draft m tokens lazily, no per-step CPU sync ──
+        // Each step's sampled token ([1] lazy array) feeds the next step's
+        // embedding lookup; the MTP post-norm hidden chains as next h_prev.
+        var drafts = try allocator.alloc(u32, m);
+        errdefer allocator.free(drafts);
+        const draft_arrs = try allocator.alloc(mlx.mlx_array, m);
+        defer {
+            for (draft_arrs) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(draft_arrs);
+        }
+
+        const t1_i32: i32 = @intCast(t1);
+        const t1_shape = [_]c_int{1};
+        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(t1_arr);
+
+        var h_prev_owner: ?mlx.mlx_array = null;
+        defer if (h_prev_owner) |h| {
+            _ = mlx.mlx_array_free(h);
+        };
+
+        {
+            var prev_tok_arr: mlx.mlx_array = t1_arr;
+            var i: u32 = 0;
+            while (i < m) : (i += 1) {
+                const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
+                const step_out = try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
+                draft_arrs[i] = sampleTokenLazy(step_out.logits, self.sampling, s);
+                _ = mlx.mlx_array_free(step_out.logits);
+                if (h_prev_owner) |h_old| {
+                    _ = mlx.mlx_array_free(h_old);
+                }
+                h_prev_owner = step_out.hidden_next;
+                prev_tok_arr = draft_arrs[i];
+            }
+        }
+
+        // ── Phase 2: snapshot trunk KV + SSM + MoE offset ──
+        var kv_snap = try self.ctx.cache.snapshot();
+        defer kv_snap.deinit();
+        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
+        defer if (ssm_snaps) |snaps| {
+            for (snaps) |*sn| ssmSnapshotDeinit(sn);
+            xfm.allocator.free(snaps);
+        };
+        if (self.ctx.ssm_entries) |entries| {
+            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
+            for (entries, 0..) |*entry, idx| out[idx] = ssmSnapshot(entry);
+            ssm_snaps = out;
+        }
+        const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
+
+        // ── Phase 3: verify input [t1, drafts...] as one [1, 1+m] tensor ──
+        const reshape_2d = [_]c_int{ 1, 1 };
+        var t1_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(t1_2d);
+        try mlx.check(mlx.mlx_reshape(&t1_2d, t1_arr, &reshape_2d, 2, s));
+
+        var verify_input = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_input);
+        {
+            const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+            defer {
+                for (drafts_2d) |arr| _ = mlx.mlx_array_free(arr);
+                allocator.free(drafts_2d);
+            }
+            for (draft_arrs, drafts_2d) |dlazy, *out| {
+                out.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
+            }
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, t1_2d);
+            for (drafts_2d) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
+        }
+
+        var new_hidden = mlx.mlx_array_new();
+        var verify_hidden_all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_hidden_all);
+        // Captures the post-final-norm hidden at the LAST position (next
+        // round's h_prev) AND all 1+m positions (history re-append).
+        const verify_logits = try xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all);
+        self.mtp_attempted += 1;
+
+        // ── Phase 4: decide longest accepted prefix ──
+        const stochastic = self.sampling.temperature > 0.01;
+        const vl_shape = mlx.getShape(verify_logits);
+
+        var per_pos_logits: ?[]mlx.mlx_array = null;
+        defer if (per_pos_logits) |slots| {
+            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        };
+        if (stochastic) {
+            const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
+            const slice_strides = [_]c_int{ 1, 1, 1 };
+            for (slots, 0..) |*slot, idx| {
+                slot.* = mlx.mlx_array_new();
+                const start = [_]c_int{ 0, @intCast(idx), 0 };
+                const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
+                try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+            }
+            per_pos_logits = slots;
+        }
+
+        var verify_argmax = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_argmax);
+        if (!stochastic) {
+            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+        }
+        _ = mlx.mlx_array_free(verify_logits);
+
+        // ── Phase 4b: one batched async eval for the whole round ──
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            for (draft_arrs) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+            if (!stochastic) {
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+            }
+            _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+        }
+        for (draft_arrs, 0..) |arr, idx| {
+            try mlx.check(mlx.mlx_array_eval(arr));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, arr));
+            drafts[idx] = @intCast(v);
+        }
+        if (!stochastic) {
+            // Separate graph branch from the draft chain — force it before
+            // bulk-reading (see the v26.5.6 0%-acceptance note in nextDrafter).
+            try mlx.check(mlx.mlx_array_eval(verify_argmax));
+        }
+
+        var accepted: u32 = 0;
+        if (stochastic) {
+            // One-hot proposal (argmax draft): accept with min(1, target_p).
+            var k: u32 = 0;
+            while (k < m) : (k += 1) {
+                const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
+                defer _ = mlx.mlx_array_free(target_p);
+                const p_draft = try probAt(target_p, drafts[k], s);
+                const accept_prob: f32 = @min(1.0, p_draft);
+                const u: f32 = self.prng.random().float(f32);
+                if (u >= accept_prob) break;
+                accepted += 1;
+            }
+        } else {
+            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
+                return error.MlxArrayDataNull;
+            };
+            var k: u32 = 0;
+            while (k < m) : (k += 1) {
+                const target_argmax: u32 = @intCast(argmax_data[k]);
+                if (target_argmax != drafts[k]) break;
+                accepted += 1;
+            }
+        }
+
+        const next_pending: u32 = blk: {
+            if (stochastic) {
+                const correction_logits = per_pos_logits.?[accepted];
+                const probs = try probsAtLastPos(correction_logits, self.sampling, s);
+                defer _ = mlx.mlx_array_free(probs);
+                if (accepted < m) {
+                    const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
+                    defer _ = mlx.mlx_array_free(onehot);
+                    break :blk try sampleResidual(probs, onehot, s);
+                } else {
+                    break :blk try sampleFromProbs(probs, s);
+                }
+            } else {
+                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
+                    return error.MlxArrayDataNull;
+                };
+                break :blk @intCast(argmax_data[accepted]);
+            }
+        };
+
+        log.debug("  [mtp-round] off0={d} t1={d} drafts={any} accepted={d}\n", .{ mtp_off0, t1, drafts, accepted });
+
+        // ── Phase 5a: rebuild the MTP committed history from true hiddens ──
+        // Restore to the round boundary, then append (h_prev, t1) followed by
+        // (verify_hidden[i], drafts[i]) for each committed draft. Uses the
+        // ORIGINAL verify hiddens — identical values to what a repair forward
+        // recomputes, so partial accepts don't need a second capture.
+        try mc.restore(&mtp_snap);
+        {
+            const n_commit: usize = accepted;
+            const hist_tokens = try allocator.alloc(u32, 1 + n_commit);
+            defer allocator.free(hist_tokens);
+            hist_tokens[0] = t1;
+            for (drafts[0..n_commit], 0..) |d, idx| hist_tokens[1 + idx] = d;
+
+            var hist_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(hist_hidden);
+            if (n_commit == 0) {
+                try mlx.check(mlx.mlx_array_set(&hist_hidden, self.last_hidden));
+            } else {
+                const vh_shape = mlx.getShape(verify_hidden_all);
+                var vh_slice = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(vh_slice);
+                const start = [_]c_int{ 0, 0, 0 };
+                const stop = [_]c_int{ 1, @intCast(n_commit), vh_shape[2] };
+                const strides = [_]c_int{ 1, 1, 1 };
+                try mlx.check(mlx.mlx_slice(&vh_slice, verify_hidden_all, &start, 3, &stop, 3, &strides, 3, s));
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                _ = mlx.mlx_vector_array_append_value(vec, self.last_hidden);
+                _ = mlx.mlx_vector_array_append_value(vec, vh_slice);
+                try mlx.check(mlx.mlx_concatenate_axis(&hist_hidden, vec, 1, s));
+            }
+            try mtp_mod.appendHistory(head, xfm, mc, hist_tokens, hist_hidden, @intCast(mtp_off0));
+        }
+
+        // ── Phase 5b: commit / rollback the trunk ──
+        if (accepted == m) {
+            const tokens = try allocator.alloc(u32, 1 + m);
+            tokens[0] = t1;
+            for (drafts, 0..) |d, idx| tokens[1 + idx] = d;
+
+            try self.generated_ids.append(allocator, t1);
+            for (drafts) |d| try self.generated_ids.append(allocator, d);
+
+            if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
+            self.last_hidden = new_hidden;
+            self.has_last_hidden = true;
+
+            self.mtp_accepted_tokens += m;
+            self.next_token_id = next_pending;
+            self.step += 1 + m;
+            self.completion_tokens += 1 + m;
+
+            allocator.free(drafts);
+            self.updateMtpDepth(m, m);
+            return DrafterStepResult{
+                .tokens = tokens,
+                .accepted_tokens = m,
+            };
+        }
+
+        // Partial accept: roll back the trunk and re-forward
+        // [t1, drafts[0..accepted]] with last-hidden capture.
+        _ = mlx.mlx_array_free(new_hidden);
+
+        try self.ctx.cache.restore(&kv_snap);
+        if (ssm_snaps) |snaps| {
+            for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+        }
+        self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
+
+        const re_seq_len: c_int = @intCast(1 + accepted);
+        const re_input_buf = try allocator.alloc(i32, 1 + accepted);
+        defer allocator.free(re_input_buf);
+        re_input_buf[0] = @intCast(t1);
+        for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
+        const re_shape = [_]c_int{ 1, re_seq_len };
+        const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(re_input);
+
+        var re_new_hidden = mlx.mlx_array_new();
+        const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
+        _ = mlx.mlx_array_free(re_logits);
+
+        const tokens = try allocator.alloc(u32, 1 + accepted);
+        tokens[0] = t1;
+        for (drafts[0..accepted], 0..) |d, idx| tokens[1 + idx] = d;
+
+        try self.generated_ids.append(allocator, t1);
+        for (drafts[0..accepted]) |d| try self.generated_ids.append(allocator, d);
+
+        if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
+        self.last_hidden = re_new_hidden;
+        self.has_last_hidden = true;
+
+        self.mtp_accepted_tokens += accepted;
+        self.next_token_id = next_pending;
+        self.step += 1 + accepted;
+        self.completion_tokens += 1 + accepted;
+
+        allocator.free(drafts);
+        self.updateMtpDepth(m, accepted);
+        return DrafterStepResult{
+            .tokens = tokens,
+            .accepted_tokens = accepted,
+        };
+    }
+
+    // ── MTP adaptive depth ──
+    // Unlike the drafter's binary gate, the MTP head has a useful fallback
+    // BETWEEN "full depth" and "off": depth 1. Measured on Qwen3.6-27B
+    // (M4 Max, greedy): creative content runs 48% per-draft at depth 2
+    // (a regression vs AR) but 73% at depth 1 (1.11× AR); code runs 89% at
+    // depth 2 (1.45× AR). A windowed controller demotes/promotes between
+    // depths and only disables outright when even depth 1 can't pay for its
+    // verify overhead.
+    pub const MTP_DEPTH_WINDOW: u32 = 16; // rounds in the moving window
+    pub const MTP_DEPTH_SWITCH_WARMUP: u32 = 5; // rounds before re-evaluating after a switch
+    pub const MTP_DEMOTE_BELOW: f32 = 0.60; // per-draft rate at depth > 1 → step down
+    pub const MTP_PROMOTE_ABOVE: f32 = 0.85; // per-draft rate below configured depth → step up
+    pub const MTP_DISABLE_BELOW: f32 = 0.50; // per-draft rate at depth 1 → disable (sticky)
+    pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
+
+    /// Pure depth-policy step. `rate` is the windowed per-draft acceptance
+    /// probability. Returns the new depth; 0 means "disable speculation".
+    pub fn mtpNextDepth(current: u32, configured: u32, rate: f32) u32 {
+        if (current > 1 and rate < MTP_DEMOTE_BELOW) return current - 1;
+        if (current <= 1 and rate < MTP_DISABLE_BELOW) return 0;
+        if (current < configured and rate > MTP_PROMOTE_ABOVE) return current + 1;
+        return current;
+    }
+
+    /// Confidence-gated depth decision. Demoting is cheap (still
+    /// speculating) so it reacts on a small sample; DISABLING is sticky and
+    /// PROMOTING raises verify cost, so both require more evidence. A
+    /// 16-round window at a true 73% per-draft rate essentially never dips
+    /// below the 0.50 disable floor; a 5-round window does (observed live:
+    /// an early-story cold streak disabled a request that would have run
+    /// 1.11x at depth 1).
+    pub fn mtpDepthDecision(current: u32, configured: u32, rate: f32, window_rounds: u32, promote_blocked: bool) u32 {
+        const next_depth = mtpNextDepth(current, configured, rate);
+        if (next_depth == 0 and window_rounds < MTP_DEPTH_WINDOW) return current;
+        if (next_depth > current and (window_rounds < 8 or promote_blocked)) return current;
+        return next_depth;
+    }
+
+    /// Windowed adaptive-depth update, called once per nextMtp round with
+    /// that round's (drafted, accepted) counts.
+    fn updateMtpDepth(self: *Generator, drafted: u32, accepted: u32) void {
+        const idx = self.mtp_window_idx % MTP_DEPTH_WINDOW;
+        self.mtp_window_drafted[idx] = @intCast(drafted);
+        self.mtp_window_accepted[idx] = @intCast(accepted);
+        self.mtp_window_idx += 1;
+        if (self.mtp_promote_cooldown > 0) self.mtp_promote_cooldown -= 1;
+        if (self.mtp_rounds_since_switch < MTP_DEPTH_SWITCH_WARMUP) {
+            self.mtp_rounds_since_switch += 1;
+            return;
+        }
+        const n = @min(self.mtp_window_idx, MTP_DEPTH_WINDOW);
+        var drafted_sum: u32 = 0;
+        var accepted_sum: u32 = 0;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            drafted_sum += self.mtp_window_drafted[i];
+            accepted_sum += self.mtp_window_accepted[i];
+        }
+        if (drafted_sum == 0) return;
+        const rate = @as(f32, @floatFromInt(accepted_sum)) / @as(f32, @floatFromInt(drafted_sum));
+        const next_depth = mtpDepthDecision(self.mtp_depth_current, self.mtp_depth, rate, n, self.mtp_promote_cooldown > 0);
+        if (next_depth == self.mtp_depth_current) return;
+        if (next_depth == 0) {
+            log.info(
+                "  mtp=disabled (windowed per-draft rate {d:.2} < {d:.2} at depth 1)\n",
+                .{ rate, MTP_DISABLE_BELOW },
+            );
+            self.spec_disabled_runtime = true;
+            return;
+        }
+        log.debug("  [mtp-depth] {d} -> {d} (windowed per-draft rate {d:.2})\n", .{ self.mtp_depth_current, next_depth, rate });
+        if (next_depth < self.mtp_depth_current) self.mtp_promote_cooldown = MTP_PROMOTE_COOLDOWN;
+        self.mtp_depth_current = next_depth;
+        self.mtp_rounds_since_switch = 0;
+        // Reset the window so the new depth is judged on its own rounds.
+        self.mtp_window_idx = 0;
+    }
+
 
     /// Returns the next token ID, or null when generation is finished.
     ///
@@ -2913,6 +3444,111 @@ fn finishDrafterResult(
         });
     } else {
         log.debug("Decode (drafter): {d}ms ({d} tokens, {d:.3} tok/s; no draft attempts)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+        });
+    }
+    gen.logSpecStats();
+    const strip_leading = tok.tok_type == .sentencepiece_bpe;
+    const text = try tok.decode(allocator, output_ids.items, strip_leading);
+    const token_ids = try output_ids.toOwnedSlice(allocator);
+    return .{
+        .text = text,
+        .token_ids = token_ids,
+        .prompt_tokens = gen.prompt_tokens,
+        .completion_tokens = gen.completion_tokens,
+        .finish_reason = gen.finish_reason,
+        .prefill_tps = prefill_tps,
+        .decode_tps = decode_tps,
+        .logprobs = null,
+    };
+}
+
+/// MTP-enabled non-streaming variant of `generate`. Mirrors `generateDrafter`
+/// but drives `nextMtp` (the model's own multi-token-prediction head).
+/// `head` must already be `bind()`-ed to `xfm`.
+pub fn generateMtp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    head: *mtp_mod.MtpModel,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    sampling: SamplingParams,
+    eos_token_ids: []const u32,
+    timeout_ns: u64,
+    depth: u32,
+    lookup_prompt: ?[]const u32,
+) !GenerationResult {
+    var timer = io_util.Stopwatch.init(io);
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
+        .mtp_enabled = true,
+        .mtp = head,
+        .mtp_depth = depth,
+        .lookup_prompt = lookup_prompt,
+    });
+    gen.timeout_ns = timeout_ns;
+    defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    log.debug("Prefill (mtp): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
+        prefill_ns / std.time.ns_per_ms,
+        prompt_ids.len,
+        prefill_tps,
+    });
+
+    var output_ids = std.ArrayList(u32).empty;
+    defer output_ids.deinit(allocator);
+
+    timer.reset();
+
+    decode: while (!gen.done and gen.completion_tokens < max_tokens) {
+        const result = (try gen.nextMtp(allocator)) orelse break;
+        defer allocator.free(result.tokens);
+        for (result.tokens) |tok_id| {
+            if (isEosId(tok_id, eos_token_ids)) {
+                gen.done = true;
+                gen.finish_reason = "stop";
+                break :decode;
+            }
+            try output_ids.append(allocator, tok_id);
+            if (output_ids.items.len >= max_tokens) {
+                gen.done = true;
+                gen.finish_reason = "length";
+                break :decode;
+            }
+        }
+        if (timeout_ns > 0 and timer.read() >= timeout_ns) {
+            gen.done = true;
+            gen.finish_reason = "length";
+            break;
+        }
+    }
+
+    const decode_ns = timer.read();
+    const num_decoded = output_ids.items.len;
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    if (gen.mtp_attempted > 0) {
+        const avg_acc: f64 = @as(f64, @floatFromInt(gen.mtp_accepted_tokens)) / @as(f64, @floatFromInt(gen.mtp_attempted));
+        log.info("Decode (mtp): {d}ms ({d} tokens, {d:.3} tok/s; mtp accept={d}/{d} attempts, avg {d:.2} tokens/attempt)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+            gen.mtp_accepted_tokens,
+            gen.mtp_attempted,
+            avg_acc,
+        });
+    } else {
+        log.debug("Decode (mtp): {d}ms ({d} tokens, {d:.3} tok/s; no draft attempts)\n", .{
             decode_ns / std.time.ns_per_ms,
             num_decoded,
             decode_tps,
@@ -4044,6 +4680,40 @@ test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps f
     // (was 4 at the raw 256), while a dense/non-MoE hybrid stays at 4.
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK), 0));
     try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK), 0));
+}
+
+test "mtpNextDepth: adaptive depth policy transitions" {
+    const configured: u32 = 3;
+    // Hot at configured depth: stay.
+    try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(3, configured, 0.9));
+    // Sagging at depth > 1: step down (one level at a time).
+    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(3, configured, 0.48));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(2, configured, 0.55));
+    // Mid-band: hold.
+    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(2, configured, 0.70));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(1, configured, 0.73));
+    // Hot below configured depth: promote.
+    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(1, configured, 0.89));
+    // Never exceeds configured.
+    try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(3, configured, 0.99));
+    // Depth 1 below the floor: disable (0).
+    try testing.expectEqual(@as(u32, 0), Generator.mtpNextDepth(1, configured, 0.40));
+    // Demote-before-disable: a terrible rate at depth 2 still goes through 1.
+    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(2, configured, 0.10));
+}
+
+test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
+    const W = Generator.MTP_DEPTH_WINDOW;
+    // Disable needs a FULL window of evidence; small samples hold at depth 1.
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.20, 5, false));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.20, W - 1, false));
+    try testing.expectEqual(@as(u32, 0), Generator.mtpDepthDecision(1, 3, 0.20, W, false));
+    // Promote needs >= 8 rounds AND no active cooldown.
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.95, 7, false));
+    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthDecision(1, 3, 0.95, 8, false));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.95, 8, true));
+    // Demote reacts on a small sample, even during cooldown.
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(2, 3, 0.30, 5, true));
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

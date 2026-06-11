@@ -9,6 +9,7 @@ const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
+const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -67,6 +68,12 @@ fn printUsage(io: std.Io) void {
         \\  --draft-block-size <n>  Tokens per drafter round. Default is
         \\                        auto-detected per Gemma 4 target (E2B=2,
         \\                        E4B=4, 26B-A4B=4, 31B=8); pass to override.
+        \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
+        \\                        when the model dir ships mtp/weights.safetensors;
+        \\                        priority: MTP > drafter > PLD).
+        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default: 1).
+        \\                        Depths >1 adapt down per-request when the
+        \\                        acceptance rate sags.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        off (default), 4, 8     — affine group quant.
         \\                        turbo2, turbo4          — Hadamard-rotated
@@ -175,6 +182,8 @@ pub fn main(init: std.process.Init) !void {
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
+    var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    var mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -260,6 +269,11 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             draft_block_size = try std.fmt.parseInt(u32, args[i], 10);
             draft_block_size_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
+            enable_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
+            i += 1;
+            mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -683,6 +697,8 @@ pub fn main(init: std.process.Init) !void {
             .chat_config = chat_config,
             .model_dir = model_dir,
             .drafter_dir = drafter_dir orelse "",
+            .mtp_enabled = enable_mtp,
+            .mtp_depth = mtp_depth,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
@@ -759,6 +775,19 @@ pub fn main(init: std.process.Init) !void {
             xfm.compileGdnGate();
         }
         log.info("Model ready.\n", .{});
+
+        // Qwen native MTP head — auto-load when the model ships a sidecar.
+        var mtp_head: ?mtp_mod.MtpModel = null;
+        defer if (mtp_head) |*h| h.deinit();
+        if (enable_mtp and mtp_mod.hasMtpSidecar(io, model_dir)) {
+            mtp_head = try mtp_mod.loadMtp(io, allocator, xfm.s, model_dir);
+            mtp_head.?.bind(&xfm) catch |err| {
+                log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
+                mtp_head.?.deinit();
+                mtp_head = null;
+            };
+        }
+
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
             .{ .role = "user", .content = user_prompt },
@@ -814,7 +843,10 @@ pub fn main(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = if (mtp_head) |*h|
+                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, mtp_depth, null)
+            else
+                try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
             defer allocator.free(result.token_ids);
 

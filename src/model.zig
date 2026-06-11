@@ -1287,10 +1287,10 @@ test "ModelConfig BERT has no sliding window" {
 }
 
 test "shouldKeepWeightKey accepts orphan MTP head weights on Qwen3.5/3.6 checkpoints" {
-    // MTPLX-style Qwen3.5/3.6 checkpoints ship `*.mtp.*` tensors even though
-    // we no longer have an MTP head. The safetensors iterator must let them
-    // through (they're neither vision nor audio) so the model loads cleanly;
-    // the binder simply ignores them.
+    // Some Qwen3.5/3.6 checkpoints embed `*.mtp.*` tensors in the MAIN
+    // shards (the sidecar-based MTP head in src/mtp.zig loads separately).
+    // The safetensors iterator must let them through (they're neither vision
+    // nor audio) so the model loads cleanly; the trunk binder ignores them.
     try testing.expect(shouldKeepWeightKey("language_model.model.mtp.0.eh_proj.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.mtp.0.eh_proj.weight", false));
     try testing.expect(shouldKeepWeightKey("model.mtp.0.shared_head.head.weight", false));

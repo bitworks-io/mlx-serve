@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.6.9 — Qwen 3.6 predicts its own future
+
+- **Native multi-token prediction for Qwen 3.6.** Models that ship Qwen's trained MTP head as an `mtp/` sidecar (like [ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve)) now use it automatically: the model drafts its own next tokens and verifies them in one pass, with exact rejection sampling — same output distribution, measurably faster. Agent-style edit and echo workloads decode **up to 1.8× faster** (29 → 51.6 tok/s on Qwen3.6-27B 4-bit, M4 Max), code generation 1.43×, creative writing ~1.1× — beating the reference MTP runtime on every workload measured, at identical output quality.
+- **Zero setup.** Drop a model with an `mtp/weights.safetensors` sidecar into your model folder and every API surface — chat completions, Anthropic messages, Responses, and FIM completions, streaming and non-streaming — speculates by default. `--no-mtp` or per-request `enable_mtp: false` opts out; `--mtp-depth` goes deeper.
+- **Self-tuning speculation.** The MTP controller watches its own acceptance rate per request and adapts draft depth on the fly, so echo-heavy agent turns speculate aggressively while novel prose stays at the safe depth — no manual tuning pass required.
+
+---
+
 ## v26.6.8 — Smarter speculation, honest reasoning, agent-ready defaults
 
 - **Local coding agents work out of the box.** Requests that omit `max_tokens` now generate until done (bounded by the context window) instead of stopping at 256 tokens — the old cap silently cut agent clients like pi off mid-thought on every turn. Verified end to end: pi completes multi-step build-test-fix coding tasks against both Qwen 3.6 and Gemma 4 models.

@@ -37,6 +37,8 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const DrafterModel = drafter_mod.DrafterModel;
+const mtp_mod = @import("mtp.zig");
+const MtpModel = mtp_mod.MtpModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
 const TokenizeCache = tokenize_cache_mod.TokenizeCache;
 
@@ -115,6 +117,11 @@ pub const LoadedModel = struct {
     /// path; empty when no drafter is loaded. Allocator-owned dupe.
     drafter_path: []const u8,
     drafter_block_size: u32,
+    /// Qwen native MTP head, auto-loaded when the model dir ships an
+    /// `mtp/weights.safetensors` sidecar that binds to this trunk.
+    mtp: ?*MtpModel = null,
+    /// Default draft depth for MTP rounds (CLI `--mtp-depth`).
+    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Per-model hot prefix cache — plan 05 drops the module-global hot
     /// cache. `model_id`-keyed isolation falls out of "one cache per
     /// LoadedModel" by construction.
@@ -218,6 +225,11 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        if (self.mtp) |h| {
+            h.deinit();
+            self.allocator.destroy(h);
+            self.mtp = null;
+        }
         if (self.drafter) |d| {
             d.deinit();
             self.allocator.destroy(d);
@@ -286,6 +298,11 @@ pub const LoadedModel = struct {
         if (self.llama_engine) |engine| {
             engine.close();
             self.llama_engine = null;
+        }
+        if (self.mtp) |h| {
+            h.deinit();
+            self.allocator.destroy(h);
+            self.mtp = null;
         }
         if (self.drafter) |d| {
             d.deinit();

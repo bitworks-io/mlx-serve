@@ -37,6 +37,7 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const drafter_mod = @import("drafter.zig");
+const mtp_mod = @import("mtp.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
@@ -99,6 +100,10 @@ pub const LoadParams = struct {
     /// Path to the assistant drafter checkpoint. Empty disables the drafter.
     /// Borrowed; outlive scheduler.
     drafter_dir: []const u8 = "",
+    /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
+    mtp_enabled: bool = true,
+    /// Default MTP draft depth (CLI --mtp-depth).
+    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -184,6 +189,9 @@ pub const SubmitParams = struct {
     enable_drafter: bool = false,
     drafter: ?*DrafterModel = null,
     drafter_block_size: u32 = 4,
+    enable_mtp: bool = false,
+    mtp: ?*mtp_mod.MtpModel = null,
+    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     pld_draft_len: u32 = 5,
     pld_key_len: u32 = 3,
     /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
@@ -285,6 +293,9 @@ pub const Slot = struct {
     enable_drafter: bool,
     drafter: ?*DrafterModel,
     drafter_block_size: u32,
+    enable_mtp: bool,
+    mtp: ?*mtp_mod.MtpModel,
+    mtp_depth: u32,
     pld_draft_len: u32,
     pld_key_len: u32,
     /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
@@ -426,6 +437,9 @@ pub const Slot = struct {
             .enable_drafter = params.enable_drafter,
             .drafter = params.drafter,
             .drafter_block_size = params.drafter_block_size,
+            .enable_mtp = params.enable_mtp,
+            .mtp = params.mtp,
+            .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,
             .pld_key_len = params.pld_key_len,
             .kv_attn_fused = params.kv_attn_fused,
@@ -709,6 +723,10 @@ pub const LoadRequest = struct {
     /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
     model_dir: []const u8,
     drafter_dir: []const u8 = "",
+    /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
+    mtp_enabled: bool = true,
+    /// Default MTP draft depth (CLI --mtp-depth).
+    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
 
     load_vision: bool = false,
     warmup_eager: bool = true,
@@ -1393,7 +1411,7 @@ pub const Scheduler = struct {
     /// means the scheduler's startup config is no longer authoritative.
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
         _ = self;
-        if (slot.enable_pld or slot.enable_drafter) return false;
+        if (slot.enable_pld or slot.enable_drafter or slot.enable_mtp) return false;
         if (slot.sampling.constraint != null) return false;
         if (slot.logprobs_n > 0) return false;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
@@ -1862,6 +1880,33 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(d);
     };
 
+    // Qwen native MTP head (optional). Auto-loaded when the model dir ships
+    // an `mtp/weights.safetensors` sidecar that binds to this trunk; a
+    // failed load or bind only disables the head — the model still serves.
+    var mtp_ptr: ?*mtp_mod.MtpModel = null;
+    if (params.mtp_enabled and mtp_mod.hasMtpSidecar(sch.io, params.model_dir)) {
+        if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
+            if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
+                h.* = loaded;
+                if (h.bind(xfm_ptr)) {
+                    mtp_ptr = h;
+                    log.info("MTP head ready (depth={d}).\n", .{params.mtp_depth});
+                } else |bind_err| {
+                    log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
+                    h.deinit();
+                    sch.allocator.destroy(h);
+                }
+            } else |load_err| {
+                log.warn("Failed to load MTP sidecar: {s} — disabled.\n", .{@errorName(load_err)});
+                sch.allocator.destroy(h);
+            }
+        } else |_| {}
+    }
+    errdefer if (mtp_ptr) |h| {
+        h.deinit();
+        sch.allocator.destroy(h);
+    };
+
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path — observed savings on Gemma 4 E4B 4-bit.
@@ -1891,6 +1936,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.vision_encoder = vision_ptr;
     entry.drafter = drafter_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
+    entry.mtp = mtp_ptr;
+    entry.mtp_depth = params.mtp_depth;
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to
@@ -2650,8 +2697,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
 
-    const use_drafter = slot.enable_drafter and slot.drafter != null;
-    const use_pld = !use_drafter and slot.enable_pld;
+    const use_mtp = slot.enable_mtp and slot.mtp != null;
+    const use_drafter = !use_mtp and slot.enable_drafter and slot.drafter != null;
+    const use_pld = !use_mtp and !use_drafter and slot.enable_pld;
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
@@ -2713,13 +2761,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
+            .mtp_enabled = use_mtp,
+            .mtp = if (use_mtp) slot.mtp else null,
+            .mtp_depth = slot.mtp_depth,
             .lookup_prompt = slot.full_prompt,
             .ctx = slot.ctx,
             // Regular path: skip the lazy preforward so cache.step lands at
             // exactly prompt_len with t1 NOT in cache. Generator.next's
             // transition shim sync-forwards [t1] on the first decode call.
-            // PLD/drafter init paths already skip preforward unconditionally.
-            .skip_lazy_preforward = !use_pld and !use_drafter,
+            // PLD/drafter/MTP init paths already skip preforward unconditionally.
+            .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -2844,6 +2895,30 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
+    if (slot.enable_mtp and gen.mtp != null) {
+        const result = try gen.nextMtp(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
+        }
+        defer slot.allocator.free(result.?.tokens);
+        for (result.?.tokens) |t| {
+            if (slot.cancelled.load(.acquire)) return;
+            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+                finishSlot(sch, slot, "stop");
+                return;
+            }
+            slot.pushToken(t);
+            slot.completion_tokens = gen.completion_tokens;
+            if (t != 0) slot.was_pad_only = false;
+            if (slot.completion_tokens >= slot.max_tokens) {
+                finishSlot(sch, slot, "length");
+                return;
+            }
+        }
+        return;
+    }
+
     if (slot.enable_drafter and gen.drafter != null) {
         const result = try gen.nextDrafter(slot.allocator);
         if (result == null) {
