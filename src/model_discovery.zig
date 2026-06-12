@@ -50,6 +50,18 @@ fn isSupportedModelType(model_type: []const u8) bool {
     return false;
 }
 
+/// Quantization modes the MLX loader supports. Must stay in sync with
+/// `model.zig:QuantMode` (discovery deliberately avoids importing model.zig,
+/// which would drag the mlx FFI into this filesystem-only module).
+const supported_quant_modes = [_][]const u8{ "affine", "nvfp4", "mxfp4", "mxfp8" };
+
+fn isSupportedQuantMode(mode: []const u8) bool {
+    for (supported_quant_modes) |m| {
+        if (std.mem.eql(u8, mode, m)) return true;
+    }
+    return false;
+}
+
 /// Outcome of reading a candidate's config.json. Discovery treats any
 /// non-`.supported` result as "skip this directory."
 const ConfigPeek = union(enum) {
@@ -62,9 +74,8 @@ const ConfigPeek = union(enum) {
 /// Peek at a candidate's `config.json`: classify by `model_type` and
 /// `quantization.mode`. Discovery uses this to filter out:
 ///   - unsupported archs (e.g. deepseek_v4, which crashes the tokenizer)
-///   - non-affine quantizations (e.g. nvfp4 / NVIDIA FP4 — same
-///     `model_type` as a normal MLX qwen, but a weight layout our
-///     safetensors loader can't decode and which aborts on tensor read).
+///   - unsupported quantization modes (anything outside
+///     `supported_quant_modes` — affine, nvfp4, mxfp4, mxfp8).
 ///
 /// Returned strings are owned by `allocator`; the caller frees them via
 /// the helpers in `freeConfigPeek`.
@@ -87,12 +98,12 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         return .{ .unsupported_arch = dup };
     }
     // Quantization gate: if a model declares a `quantization.mode`, accept
-    // only the standard MLX `affine` scheme. Models without a quantization
+    // only the schemes the loader supports. Models without a quantization
     // block (bf16 / unquantized) pass through.
     if (root.get("quantization")) |q_val| {
         if (q_val == .object) {
             if (q_val.object.get("mode")) |mode_val| {
-                if (mode_val == .string and !std.mem.eql(u8, mode_val.string, "affine")) {
+                if (mode_val == .string and !isSupportedQuantMode(mode_val.string)) {
                     const dup = allocator.dupe(u8, mode_val.string) catch return .missing_or_unparseable;
                     return .{ .unsupported_quant = dup };
                 }
@@ -110,6 +121,10 @@ pub const DiscoveredModel = struct {
     /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
     /// later by eviction; null if scan failed.
     bytes_on_disk: ?u64,
+    /// `model_type` peeked from config.json (e.g. "bert"), so registry stubs
+    /// can advertise arch-derived capabilities before a cold load. Empty
+    /// when unknown.
+    model_type: []const u8 = "",
 };
 
 pub const DiscoveryResult = struct {
@@ -120,6 +135,7 @@ pub const DiscoveryResult = struct {
         for (self.models) |*m| {
             self.allocator.free(m.id);
             self.allocator.free(m.path);
+            if (m.model_type.len > 0) self.allocator.free(m.model_type);
         }
         self.allocator.free(self.models);
     }
@@ -175,6 +191,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         for (found.items) |*m| {
             allocator.free(m.id);
             allocator.free(m.path);
+            if (m.model_type.len > 0) allocator.free(m.model_type);
         }
         found.deinit(allocator);
     }
@@ -194,10 +211,9 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
         //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
-        //   - unsupported quants (e.g. nvfp4, which shares model_type with
-        //     standard MLX qwens but uses a different weight layout)
+        //   - unsupported quants (modes outside supported_quant_modes)
         // before they reach the tokenizer/weight loaders.
-        switch (peekConfig(io, allocator, dir, entry.name)) {
+        const model_type: []const u8 = switch (peekConfig(io, allocator, dir, entry.name)) {
             .missing_or_unparseable => {
                 log.info("[discovery] skip {s}: config.json missing or unparseable", .{entry.name});
                 continue;
@@ -209,11 +225,12 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             },
             .unsupported_quant => |mode| {
                 defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (only 'affine' supported)", .{ entry.name, mode });
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ entry.name, mode });
                 continue;
             },
-            .supported => |mt| allocator.free(mt),
-        }
+            .supported => |mt| mt, // ownership moves to the DiscoveredModel
+        };
+        errdefer if (model_type.len > 0) allocator.free(model_type);
 
         // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
         var bytes: u64 = 0;
@@ -237,6 +254,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             .id = id,
             .path = path,
             .bytes_on_disk = if (bytes_ok) bytes else null,
+            .model_type = model_type,
         });
     }
 
@@ -253,6 +271,59 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
     var p = s;
     while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
     return p;
+}
+
+pub const ProbeResult = struct {
+    /// Owned dupe of the supported model_type.
+    model_type: []const u8,
+    /// Sum of *.safetensors bytes; null if the scan failed.
+    bytes_on_disk: ?u64,
+};
+
+/// Validate an arbitrary absolute model directory the way discovery would
+/// (config.json present, supported model_type and quant mode) and report its
+/// weight bytes. Used by /v1/load-model's register-by-path branch for models
+/// OUTSIDE the --model-dir scan — e.g. the app's auto-downloaded embedding
+/// encoder, which lands wherever the download root is regardless of which
+/// org dir the chat model came from.
+pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) !ProbeResult {
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return error.InvalidModelPath;
+    if (base.len == 0 or parent.len == 0) return error.InvalidModelPath;
+
+    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
+    defer dir.close(io);
+
+    const model_type: []const u8 = switch (peekConfig(io, allocator, dir, base)) {
+        .missing_or_unparseable => return error.ModelDirNotFound,
+        .unsupported_arch => |mt| {
+            allocator.free(mt);
+            return error.UnsupportedArch;
+        },
+        .unsupported_quant => |mode| {
+            allocator.free(mode);
+            return error.UnsupportedQuantMode;
+        },
+        .supported => |mt| mt,
+    };
+    errdefer allocator.free(model_type);
+
+    var bytes: u64 = 0;
+    var bytes_ok = false;
+    var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
+    if (sub) |*sd| {
+        defer sd.close(io);
+        var it = sd.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+            const st = sd.statFile(io, entry.name, .{}) catch continue;
+            bytes += @intCast(st.size);
+            bytes_ok = true;
+        }
+    }
+    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null };
 }
 
 fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
@@ -325,4 +396,15 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("qwen3"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
+}
+
+test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
+    // Regression for "[discovery] skip ...: unsupported quantization mode
+    // 'nvfp4'": nvfp4 / mxfp4 / mxfp8 checkpoints are loadable and must be
+    // discoverable.
+    try testing.expect(isSupportedQuantMode("affine"));
+    try testing.expect(isSupportedQuantMode("nvfp4"));
+    try testing.expect(isSupportedQuantMode("mxfp4"));
+    try testing.expect(isSupportedQuantMode("mxfp8"));
+    try testing.expect(!isSupportedQuantMode("fp99"));
 }

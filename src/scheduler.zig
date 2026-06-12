@@ -38,6 +38,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
@@ -274,6 +275,11 @@ pub const Slot = struct {
     /// requests for prompt-prefix KV reuse) — NOT owned, so `Slot.deinit` must
     /// not free it. Mutually exclusive with `legacy_gen` and `ds4_session`.
     llama_session: ?*arch_llama.LlamaSession = null,
+    /// DiffusionGemma canvas-denoising runner. Created in
+    /// `runPrefillDiffusion` for `config.isDiffusion()` models; owns the
+    /// dequantized embedding table; freed in `Slot.deinit`. Mutually
+    /// exclusive with `legacy_gen` (the autoregressive MLX path).
+    diffusion: ?*diffusion_mod.Runner = null,
     /// True when this slot claimed `model.llama_session_busy` in `submit`. The
     /// single persistent context serves one request at a time; the claim is
     /// released in `complete()`. Tracked per-slot so only the holder releases.
@@ -423,6 +429,7 @@ pub const Slot = struct {
             .ctx = undefined, // set after slot is in stable storage so pointers are valid
             .legacy_gen = null,
             .ds4_session = null,
+            .diffusion = null,
             .ds4_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
             .llama_session = null,
             .llama_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
@@ -494,6 +501,11 @@ pub const Slot = struct {
         // requests) — do NOT free it here. The claim on it is released in
         // Scheduler.complete; the session itself is freed with the model.
         self.llama_session = null;
+        if (self.diffusion) |runner| {
+            runner.deinit();
+            self.allocator.destroy(runner);
+            self.diffusion = null;
+        }
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -674,19 +686,20 @@ pub const VisionEncodeRequest = struct {
 };
 
 /// Phase: embedding work item for encoder-only models. Conn thread fills
-/// `token_ids` and calls `Scheduler.computeEmbedding`; the inference thread
-/// services the request via `generate.computeEmbedding(xfm, ...)` and writes
-/// the float vector into `result` (caller frees). Mirrors the
+/// `token_seqs` and calls `Scheduler.computeEmbeddings`; the inference
+/// thread services the request via `generate.computeEmbeddingsBatch` — one
+/// padded, key-masked GPU forward per EMBED_MAX_BATCH chunk — and writes
+/// the float vectors into `results` (caller frees). Mirrors the
 /// VisionEncodeRequest pattern.
 pub const EmbedRequest = struct {
     /// Plan 05 Phase D: target model whose `transformer` services this
     /// request. The conn thread holds a refcount for the duration.
     model: *model_registry_mod.LoadedModel,
-    /// Tokenized input. Borrowed; must outlive the call.
-    token_ids: []const u32,
-    /// Output: pooled L2-normalized embedding on success. Owned by
-    /// `allocator`; caller frees.
-    result: ?[]f32 = null,
+    /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
+    token_seqs: []const []const u32,
+    /// Output: one pooled L2-normalized embedding per input on success.
+    /// Rows + outer slice owned by `allocator`; caller frees.
+    results: ?[][]f32 = null,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     done: bool = false,
@@ -1349,11 +1362,11 @@ pub const Scheduler = struct {
         self.registry.release(lm);
     }
 
-    /// Synchronously compute an embedding for `req.token_ids` using the
-    /// encoder forward pass on the inference thread. Same lifecycle as
-    /// `encodeVision`: post + block + return result. Caller frees the
-    /// returned `[]f32` (allocated with `req.allocator`).
-    pub fn computeEmbedding(self: *Scheduler, req: *EmbedRequest) ![]f32 {
+    /// Synchronously compute embeddings for `req.token_seqs` using the
+    /// batched encoder forward pass on the inference thread. Same lifecycle
+    /// as `encodeVision`: post + block + return results. Caller frees the
+    /// returned rows + outer slice (allocated with `req.allocator`).
+    pub fn computeEmbeddings(self: *Scheduler, req: *EmbedRequest) ![][]f32 {
         self.queue_mu.lockUncancelable(self.io);
         self.embed_queue.append(self.allocator, req) catch |err| {
             self.queue_mu.unlock(self.io);
@@ -1368,7 +1381,7 @@ pub const Scheduler = struct {
             req.done_cond.waitUncancelable(self.io, &req.done_mu);
         }
         if (req.error_name) |_| return error.EmbedFailed;
-        return req.result orelse error.EmbedFailed;
+        return req.results orelse error.EmbedFailed;
     }
 
     /// Phase A4: synchronously encode one or more images and return the
@@ -1432,6 +1445,8 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
     if (cfg.full_attention_interval > 0) return false;
     if (cfg.is_encoder_only) return false;
     if (cfg.isMoe()) return false;
+    // Block diffusion denoises whole canvases — no per-token batched decode.
+    if (cfg.isDiffusion()) return false;
     return true;
 }
 
@@ -2303,8 +2318,8 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
     req.done_cond.broadcast(sch.io);
 }
 
-/// Service one embedding request on the inference thread. Runs the
-/// encoder-only forward pass via `generate.computeEmbedding(xfm, ids)`,
+/// Service one embedding request on the inference thread. Runs the batched
+/// encoder-only forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`,
 /// resets the global xfm.cache between requests (encoder-only does not
 /// share KV state across embeddings), and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
@@ -2313,13 +2328,13 @@ fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
-    const result = generate_mod.computeEmbedding(req.allocator, xfm_ptr, req.token_ids) catch |err| {
+    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
-    req.result = result;
+    req.results = results;
     req.done = true;
     req.done_cond.broadcast(sch.io);
 }
@@ -2672,6 +2687,74 @@ fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSe
     }
 }
 
+/// DiffusionGemma prefill: refresh the slot ctx, build the per-slot
+/// diffusion Runner (which dequantizes the embedding table for
+/// self-conditioning), and run the causal ENCODER pass over the full prompt
+/// to fill the slot's KV cache. The hot prefix cache is intentionally NOT
+/// consulted (v1): restored snapshots leave per-layer cache VIEWS stale, and
+/// the diffusion decoder reads them via denseView before any update would
+/// rebuild them.
+fn runPrefillDiffusion(sch: *Scheduler, slot: *Slot) !void {
+    _ = sch;
+    slot.ctx.cache = &slot.cache;
+    slot.ctx.moe_seq_offset = &slot.moe_seq_offset;
+    slot.ctx.ssm_entries = slot.ssm_entries;
+    slot.ctx.vision_embeddings = null; // vision tower not wired for this arch
+    slot.ctx.capture_hidden = null;
+    slot.ctx.kv_attn_fused = false;
+
+    const xfm: *Transformer = slot.model.transformer.?;
+    const runner = try slot.allocator.create(diffusion_mod.Runner);
+    errdefer slot.allocator.destroy(runner);
+    runner.* = try diffusion_mod.Runner.init(
+        slot.allocator,
+        xfm,
+        &slot.ctx,
+        slot.sampling.temperature,
+        slot.max_tokens,
+    );
+    errdefer runner.deinit();
+    runner.cancel_flag = &slot.cancelled;
+
+    try runner.prefill(slot.full_prompt);
+
+    slot.diffusion = runner;
+    slot.prompt_tokens = @intCast(slot.full_prompt.len);
+    slot.state = .decoding;
+}
+
+/// Diffusion decode tick: denoise and commit ONE canvas (≤ 48 decoder
+/// forwards), then emit its tokens through the slot — block-wise streaming
+/// falls out of the normal slot machinery. EOS inside the canvas finishes
+/// the request without emitting the stop token (matching the AR paths); the
+/// canvas remainder after EOS is discarded. The runner checks
+/// `slot.cancelled` once per denoising step.
+fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.Runner) !void {
+    const result = runner.nextCanvas(slot.allocator) catch |err| switch (err) {
+        error.Cancelled => return,
+        else => return err,
+    };
+    if (result == null) {
+        finishSlot(sch, slot, "length");
+        return;
+    }
+    defer slot.allocator.free(result.?.tokens);
+    for (result.?.tokens) |t| {
+        if (slot.cancelled.load(.acquire)) return;
+        if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            finishSlot(sch, slot, "stop");
+            return;
+        }
+        slot.pushToken(t);
+        if (t != 0) slot.was_pad_only = false;
+        slot.completion_tokens += 1;
+        if (slot.completion_tokens >= slot.max_tokens) {
+            finishSlot(sch, slot, "length");
+            return;
+        }
+    }
+}
+
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
@@ -2686,6 +2769,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     }
     if (slot.model.llama_engine) |engine| {
         return runPrefillLlama(sch, slot, engine);
+    }
+    // DiffusionGemma: generation is a canvas-denoising loop, not
+    // autoregressive decode — no Generator. The encoder prefill fills the
+    // slot's own KV cache; PLD/drafter/MTP/batching never apply.
+    if (slot.model.transformer.?.config.isDiffusion()) {
+        return runPrefillDiffusion(sch, slot);
     }
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
@@ -2869,6 +2958,9 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     }
     if (slot.llama_session) |session| {
         return runLlamaDecodeTick(sch, slot, session);
+    }
+    if (slot.diffusion) |runner| {
+        return runDiffusionDecodeTick(sch, slot, runner);
     }
     const gen = if (slot.legacy_gen) |*g| g else {
         slot.markError("no_generator");
