@@ -933,6 +933,12 @@ fn handleConnection(
         }
         return;
     }
+    // GET /admin — self-contained web dashboard (zero deps, polls /admin/metrics.json)
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/admin")) {
+        const html = @embedFile("admin_dashboard.html");
+        try sendResponse(stream, "200 OK", "text/html; charset=utf-8", html);
+        return;
+    }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/admin/metrics.json")) {
         if (g_metrics) |m| {
             log.debug("GET  /admin/metrics.json -> 200\n", .{});

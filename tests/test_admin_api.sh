@@ -94,6 +94,17 @@ EVICT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/admin/evict
 check "POST /admin/evict-prefix-cache open mode → 200" "$([ "$EVICT_STATUS" = "200" ] && echo 1 || echo 0)"
 check "evict response has 'ok'" "$(echo "$EVICT" | grep -q '"ok"' && echo 1 || echo 0)"
 
+# Dashboard (served regardless of --metrics; degrades gracefully without it)
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/admin")
+check "GET /admin returns 200" "$([ "$STATUS" = "200" ] && echo 1 || echo 0)"
+
+CT=$(curl -s -D - -o /dev/null "$BASE/admin" | grep -i "^content-type:" | tr -d '\r')
+check "GET /admin Content-Type is text/html" "$(echo "$CT" | grep -qi "text/html" && echo 1 || echo 0)"
+
+DASH=$(curl -s "$BASE/admin")
+check "Dashboard has stat panel elements" "$(echo "$DASH" | grep -q 'id="req-rate"' && echo "$DASH" | grep -q 'id="gpu-pct"' && echo 1 || echo 0)"
+check "Dashboard has Grafana config section" "$(echo "$DASH" | grep -q 'prom-cfg' && echo 1 || echo 0)"
+
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true; sleep 1
 

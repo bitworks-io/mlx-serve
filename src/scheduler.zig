@@ -2516,7 +2516,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             slot.decode_ns,
             slot.prompt_tokens,
             slot.completion_tokens,
-            0, // cached_tokens: Slot doesn't expose it yet; future improvement
+            slot.cached_tokens,
         );
     }
     slot.markFinished(reason);

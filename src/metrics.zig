@@ -123,7 +123,9 @@ pub const Metrics = struct {
         completion_tokens: u32,
         cached_tokens: u32,
     ) void {
-        _ = cached_tokens; // reserved for future per-request cache-hit tracking
+        // Wire prefix-cache stats unconditionally: every request queries the cache.
+        self.prefix_cache_queries_total.inc();
+        if (cached_tokens > 0) self.prefix_cache_hits_total.inc();
 
         const is_success = std.mem.eql(u8, finish_reason, "stop") or
             std.mem.eql(u8, finish_reason, "length") or
@@ -491,6 +493,9 @@ test "Metrics.recordRequest increments correct fields on success" {
     // Token histograms
     try testing.expectEqual(@as(u64, 1), m.prompt_tokens_hist.count.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), m.output_tokens_hist.count.load(.monotonic));
+    // Cache counters — called with cached_tokens=20, so query+hit both increment
+    try testing.expectEqual(@as(u64, 1), m.prefix_cache_queries_total.load());
+    try testing.expectEqual(@as(u64, 1), m.prefix_cache_hits_total.load());
 }
 
 test "Metrics.recordRequest skips histograms on cancelled request" {
@@ -506,6 +511,10 @@ test "Metrics.recordRequest skips histograms on cancelled request" {
     // Token counters also NOT touched on cancel
     try testing.expectEqual(@as(u64, 0), m.prompt_tokens_total.load());
     try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+    // Cache counters ARE touched even on cancel (the cache was still queried)
+    try testing.expectEqual(@as(u64, 1), m.prefix_cache_queries_total.load());
+    // cached_tokens=0 → no hit
+    try testing.expectEqual(@as(u64, 0), m.prefix_cache_hits_total.load());
 }
 
 test "Histogram.observe places values in the correct bucket" {
@@ -549,4 +558,41 @@ test "renderJson emits valid JSON with correct structure" {
     try testing.expect(std.mem.indexOf(u8, out, "\"prompt_tokens_total\":100") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"time_to_first_token_seconds\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"bucket_counts\"") != null);
+}
+
+test "renderJson output parses as valid JSON via stdlib parser" {
+    const testing = std.testing;
+    // Zero-state (first load): verify sum=0 doesn't produce invalid tokens like 0e0
+    var m0 = Metrics.init();
+    var buf0: [64 * 1024]u8 = undefined;
+    var w0: std.Io.Writer = .fixed(&buf0);
+    try renderJson(&m0, &w0);
+    const out0 = buf0[0..w0.end];
+
+    const parsed0 = try std.json.parseFromSlice(std.json.Value, testing.allocator, out0, .{});
+    defer parsed0.deinit();
+    const obj0 = parsed0.value.object;
+    try testing.expect(obj0.get("counters") != null);
+    try testing.expect(obj0.get("gauges") != null);
+    try testing.expect(obj0.get("histograms") != null);
+
+    // Non-zero state: observe values and re-verify parseability
+    var m1 = Metrics.init();
+    m1.requests_success_total.inc();
+    m1.prompt_tokens_total.add(512);
+    m1.ttft_ns.observe(50_000_000); // 50ms
+    m1.gpu_utilization_pct.set(42);
+
+    var buf1: [64 * 1024]u8 = undefined;
+    var w1: std.Io.Writer = .fixed(&buf1);
+    try renderJson(&m1, &w1);
+    const out1 = buf1[0..w1.end];
+
+    const parsed1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, out1, .{});
+    defer parsed1.deinit();
+    const obj1 = parsed1.value.object;
+    try testing.expect(obj1.get("counters") != null);
+    // Verify counters sub-object has expected key
+    const counters = obj1.get("counters").?.object;
+    try testing.expectEqual(@as(i64, 1), counters.get("requests_success_total").?.integer);
 }
