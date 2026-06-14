@@ -896,6 +896,10 @@ pub const Scheduler = struct {
 
     inference_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
+    /// Set by the HTTP admin thread to request prefix-cache eviction on the
+    /// next scheduling cycle. Cleared by the inference thread after handling.
+    /// Safe: written from conn thread, read from inference thread via atomics.
+    evict_cache_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -1443,6 +1447,16 @@ pub const Scheduler = struct {
         if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
         const cfg = slot.model.config orelse return false;
         return modelBatchable(cfg);
+    }
+
+    /// Called from the HTTP admin conn thread to request async prefix-cache eviction.
+    /// The inference thread processes it at the next scheduling cycle.
+    /// Thread-safe: the flag write is atomic; queue_cond wakes the sleeping thread.
+    pub fn requestCacheEviction(self: *Scheduler) void {
+        self.evict_cache_requested.store(true, .release);
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        self.queue_cond.broadcast(self.io);
     }
 };
 
@@ -2112,10 +2126,15 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and !sch.evict_cache_requested.load(.acquire) and !sch.shutdown.load(.acquire)) {
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
+
+            // Admin: prefix-cache eviction requested externally.
+            if (sch.evict_cache_requested.swap(false, .acq_rel)) {
+                if (sch.hot_prefix_cache) |hc| hc.invalidateAll("admin request");
+            }
 
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;

@@ -130,6 +130,7 @@ fn printUsage(io: std.Io) void {
         \\  --metrics           Enable Prometheus metrics endpoint at GET /metrics
         \\  --metrics-port <n>  Port used in startup log message (default: 9090)
         \\                      (metrics are served on the main --port, not a dedicated port)
+        \\  --admin-key <token> Bearer token to protect admin POST endpoints (optional)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -280,6 +281,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--metrics-port") and i + 1 < args.len) {
             i += 1;
             metrics_port_val = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--admin-key") and i + 1 < args.len) {
+            server_mod.g_admin_key = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {

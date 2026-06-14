@@ -33,6 +33,9 @@ const LoadedModel = model_registry_mod.LoadedModel;
 var shutdown_requested = std.atomic.Value(bool).init(false);
 /// Set from main.zig before serve() is called when --metrics is on.
 pub var g_metrics: ?*instr.Metrics = null;
+/// Optional admin API bearer token. If null, all admin POST endpoints are open.
+/// Set via --admin-key CLI flag.
+pub var g_admin_key: ?[]const u8 = null;
 /// Port for the gauge sampler log line (informational only; /metrics
 /// is served on the main HTTP port, not a dedicated metrics port).
 pub var metrics_port: u16 = 9090;
@@ -928,6 +931,36 @@ fn handleConnection(
         } else {
             try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics)");
         }
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/admin/metrics.json")) {
+        if (g_metrics) |m| {
+            log.debug("GET  /admin/metrics.json -> 200\n", .{});
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try instr.renderJson(m, &out.writer);
+            try sendResponse(stream, "200 OK", "application/json", out.written());
+        } else {
+            try sendResponse(stream, "503 Service Unavailable", "application/json",
+                "{\"error\":\"metrics not enabled — start with --metrics\"}");
+        }
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/admin/evict-prefix-cache")) {
+        const raw_headers = request[0..header_end_pos];
+        const auth_hdr = findHeader(raw_headers, "authorization");
+        if (!checkAdminAuth(auth_hdr)) {
+            try sendResponse(stream, "401 Unauthorized", "application/json",
+                "{\"error\":\"unauthorized — provide Authorization: Bearer <admin-key>\"}");
+            return;
+        }
+        const sch = global_scheduler orelse {
+            try sendResponse(stream, "503 Service Unavailable", "application/json",
+                "{\"error\":\"scheduler not ready\"}");
+            return;
+        };
+        sch.requestCacheEviction();
+        try sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
         return;
     }
     if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -4583,6 +4616,48 @@ fn logHttpBody(label: []const u8, body: []const u8) void {
         body.len,
         body,
     });
+}
+
+/// Find the value of a named HTTP header in the raw header block.
+/// `name` must be lowercase (e.g. "authorization"). Case-insensitive compare.
+/// Returns null if the header is absent.
+fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len <= name.len + 1) continue;
+        // Check prefix match case-insensitively up to the colon.
+        var match = true;
+        for (0..name.len) |j| {
+            if (std.ascii.toLower(line[j]) != name[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        if (line[name.len] != ':') continue;
+        const rest = line[name.len + 1 ..];
+        return std.mem.trim(u8, rest, " \t");
+    }
+    return null;
+}
+
+/// Constant-time string compare — prevents timing-oracle key guessing.
+fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
+/// Returns true if the request is authorized for admin mutating actions.
+/// If no admin key is configured (g_admin_key == null), all requests pass.
+/// `auth_header` is the value of the "Authorization" header (or null).
+fn checkAdminAuth(auth_header: ?[]const u8) bool {
+    const key = g_admin_key orelse return true; // open mode
+    const hdr = auth_header orelse return false;
+    const prefix = "Bearer ";
+    if (!std.mem.startsWith(u8, hdr, prefix)) return false;
+    return timingSafeEql(hdr[prefix.len..], key);
 }
 
 fn findContentLength(headers: []const u8) ?usize {

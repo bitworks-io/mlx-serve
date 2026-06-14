@@ -203,6 +203,58 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 }
 
 // ---------------------------------------------------------------------------
+// renderJson — JSON admin API format
+// ---------------------------------------------------------------------------
+
+/// Write all metrics as a JSON object to `w`.
+/// Called only on the scrape/admin connection thread.
+pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
+    const ns_to_s = 1.0 / 1_000_000_000.0;
+
+    try w.print(
+        "{{\"counters\":{{" ++
+        "\"prompt_tokens_total\":{d}," ++
+        "\"generation_tokens_total\":{d}," ++
+        "\"requests_success_total\":{d}," ++
+        "\"requests_cancelled_total\":{d}," ++
+        "\"prefix_cache_queries_total\":{d}," ++
+        "\"prefix_cache_hits_total\":{d}" ++
+        "}},\"gauges\":{{" ++
+        "\"requests_running\":{d}," ++
+        "\"requests_waiting\":{d}," ++
+        "\"gpu_utilization_pct\":{d}," ++
+        "\"rss_mb\":{d}" ++
+        "}},\"histograms\":{{",
+        .{
+            m.prompt_tokens_total.load(),
+            m.generation_tokens_total.load(),
+            m.requests_success_total.load(),
+            m.requests_cancelled_total.load(),
+            m.prefix_cache_queries_total.load(),
+            m.prefix_cache_hits_total.load(),
+            m.requests_running.load(),
+            m.requests_waiting.load(),
+            m.gpu_utilization_pct.load(),
+            m.rss_mb.load(),
+        },
+    );
+
+    try writeHistogramJson(w, "time_to_first_token_seconds", &m.ttft_ns, ns_to_s);
+    try w.print(",", .{});
+    try writeHistogramJson(w, "e2e_request_latency_seconds", &m.e2e_latency_ns, ns_to_s);
+    try w.print(",", .{});
+    try writeHistogramJson(w, "prefill_time_seconds", &m.prefill_time_ns, ns_to_s);
+    try w.print(",", .{});
+    try writeHistogramJson(w, "decode_time_seconds", &m.decode_time_ns, ns_to_s);
+    try w.print(",", .{});
+    try writeHistogramJson(w, "prompt_tokens", &m.prompt_tokens_hist, 1.0);
+    try w.print(",", .{});
+    try writeHistogramJson(w, "output_tokens", &m.output_tokens_hist, 1.0);
+
+    try w.print("}}}}", .{});
+}
+
+// ---------------------------------------------------------------------------
 // Internal render helpers
 // ---------------------------------------------------------------------------
 
@@ -238,6 +290,32 @@ fn writeHistogram(w: *std.Io.Writer, name: []const u8, help: []const u8, hist: a
     const sum_f = @as(f64, @floatFromInt(hist.sum.load(.monotonic))) * scale;
     try w.print("{s}_sum {d}\n", .{ name, sum_f });
     try w.print("{s}_count {d}\n\n", .{ name, hist.count.load(.monotonic) });
+}
+
+/// Render a Histogram(N) as a JSON object with cumulative bucket counts.
+/// `scale` converts raw units to display units (1e-9 for ns→s, 1.0 for counts).
+fn writeHistogramJson(w: *std.Io.Writer, name: []const u8, hist: anytype, scale: f64) !void {
+    try w.print("\"{s}\":{{\"count\":{d},\"sum\":{d},\"bounds\":[", .{
+        name,
+        hist.count.load(.monotonic),
+        @as(f64, @floatFromInt(hist.sum.load(.monotonic))) * scale,
+    });
+
+    for (hist.bounds, 0..) |bound, i| {
+        if (i > 0) try w.print(",", .{});
+        try w.print("{d}", .{@as(f64, @floatFromInt(bound)) * scale});
+    }
+
+    try w.print("],\"bucket_counts\":[", .{});
+    var cumulative: u64 = 0;
+    for (hist.bounds, 0..) |_, i| {
+        if (i > 0) try w.print(",", .{});
+        cumulative += hist.buckets[i].load(.monotonic);
+        try w.print("{d}", .{cumulative});
+    }
+    // +Inf bucket (index == bounds.len)
+    cumulative += hist.buckets[hist.bounds.len].load(.monotonic);
+    try w.print(",{d}]}}", .{cumulative});
 }
 
 /// Monotonically increasing lock-free counter.
@@ -446,4 +524,29 @@ test "Histogram.observe places values in the correct bucket" {
     try testing.expectEqual(@as(u64, 1), h.buckets[3].load(.monotonic));
     try testing.expectEqual(@as(u64, 5), h.count.load(.monotonic));
     try testing.expectEqual(@as(u64, 5565), h.sum.load(.monotonic));
+}
+
+test "renderJson emits valid JSON with correct structure" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.requests_success_total.inc();
+    m.prompt_tokens_total.add(100);
+    m.ttft_ns.observe(50_000_000); // 50ms
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &w);
+    const out = buf[0..w.end];
+
+    // Must be valid-ish JSON (starts { ends })
+    try testing.expect(out[0] == '{');
+    try testing.expect(out[out.len - 1] == '}');
+    // Must contain key structure fields
+    try testing.expect(std.mem.indexOf(u8, out, "\"counters\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"gauges\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"histograms\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"requests_success_total\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"prompt_tokens_total\":100") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"time_to_first_token_seconds\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"bucket_counts\"") != null);
 }
