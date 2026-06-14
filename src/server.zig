@@ -21,6 +21,7 @@ const arch_llama = @import("arch/llama.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
+const instr = @import("metrics.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -30,6 +31,11 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 /// Global flag set by signal handler for graceful shutdown.
 var shutdown_requested = std.atomic.Value(bool).init(false);
+/// Set from main.zig before serve() is called when --metrics is on.
+pub var g_metrics: ?*instr.Metrics = null;
+/// Port for the gauge sampler log line (informational only; /metrics
+/// is served on the main HTTP port, not a dedicated metrics port).
+pub var metrics_port: u16 = 9090;
 
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
@@ -584,6 +590,26 @@ pub fn serve(
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    // Gauge sampler: samples instantaneous system state every 15 s and
+    // writes to the metrics gauges. Only runs when --metrics is on.
+    // LIFO defer ordering: `stop` must be registered AFTER `join` so it runs
+    // FIRST (setting the flag), allowing the thread to exit before join() blocks.
+    // Do NOT check scheduler.shutdown here — deinit() (which sets that flag) is
+    // registered as the earliest defer and runs last, after the join.
+    var sampler_thread: ?std.Thread = null;
+    var sampler_stop = std.atomic.Value(bool).init(false);
+    if (g_metrics) |m| {
+        const ctx = GaugeSamplerCtx{
+            .metrics = m,
+            .scheduler = scheduler,
+            .stop = &sampler_stop,
+        };
+        sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{ctx});
+        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics\n", .{ host, port });
+    }
+    // LIFO: join deferred first → runs second. stop deferred second → runs first.
+    defer if (sampler_thread) |t| t.join();
+    defer sampler_stop.store(true, .monotonic);
     global_registry = scheduler.registry;
     defer global_registry = null;
 
@@ -890,6 +916,18 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
+        if (g_metrics) |m| {
+            log.debug("GET  /metrics -> 200\n", .{});
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try instr.renderPrometheus(m, &out.writer);
+            try sendResponse(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", out.written());
+        } else {
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics)");
+        }
         return;
     }
     if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -9078,6 +9116,46 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+const GaugeSamplerCtx = struct {
+    metrics: *instr.Metrics,
+    scheduler: *scheduler_mod.Scheduler,
+    /// Dedicated stop flag — set before joining the thread (LIFO defers ensure
+    /// this is written before join() blocks). Using a separate flag rather than
+    /// scheduler.shutdown avoids a LIFO deadlock: scheduler.deinit() (which sets
+    /// shutdown) is registered as the FIRST defer and therefore runs LAST, but
+    /// the join defer runs BEFORE it, so the loop would never see shutdown=true.
+    stop: *std.atomic.Value(bool),
+};
+
+/// Background thread: samples system gauges every 15 s.
+/// Exits when ctx.stop is set to true (see GaugeSamplerCtx.stop comment).
+fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
+    // Wake every 500 ms to check the stop flag; sample system state
+    // only once per 15-second interval. Uses std.c.nanosleep (POSIX) because
+    // std.time.sleep was removed in Zig 0.16 — this thread has no Io handle.
+    const SAMPLE_INTERVAL_TICKS: u64 = 30; // 30 × 500 ms = 15 s
+    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    var tick: u64 = 0;
+    while (!ctx.stop.load(.monotonic)) {
+        _ = std.c.nanosleep(&poll_ts, null);
+        tick += 1;
+        if (tick < SAMPLE_INTERVAL_TICKS) continue;
+        tick = 0;
+
+        // System gauges (non-blocking syscalls).
+        ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
+        ctx.metrics.rss_mb.set(@as(u64, metrics.getAppRssMb()));
+
+        // Request queue depth — brief lock to read scheduler counters.
+        ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
+        const running = @as(u64, ctx.scheduler.in_flight);
+        const waiting = @as(u64, ctx.scheduler.pending.items.len);
+        ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
+        ctx.metrics.requests_running.set(running);
+        ctx.metrics.requests_waiting.set(waiting);
+    }
 }
 
 test "parseJsonFloat returns value when present" {
