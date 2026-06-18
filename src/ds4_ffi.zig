@@ -72,19 +72,31 @@ pub const DistributedOptions = extern struct {
     debug: bool = false,
 };
 
+// Mirrors `ds4_engine_options` in lib/ds4/ds4.h EXACTLY (field order + types are
+// the C ABI contract; a mismatch silently corrupts the struct at open time).
+// The ssd_streaming_* / prefill_chunk / expert_profile_path / simulate_used_memory_bytes
+// fields were added upstream alongside SSD weight-streaming (issue #39).
 pub const EngineOptions = extern struct {
     model_path: ?[*:0]const u8 = null,
     mtp_path: ?[*:0]const u8 = null,
     backend: Backend = .metal,
     n_threads: c_int = 0,
+    prefill_chunk: u32 = 0,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
     directional_steering_file: ?[*:0]const u8 = null,
+    expert_profile_path: ?[*:0]const u8 = null,
     directional_steering_attn: f32 = 0,
     directional_steering_ffn: f32 = 0,
     power_percent: c_int = 0,
+    ssd_streaming_cache_experts: u32 = 0,
+    ssd_streaming_cache_bytes: u64 = 0,
+    ssd_streaming_preload_experts: u32 = 0,
+    simulate_used_memory_bytes: u64 = 0,
     warm_weights: bool = false,
     quality: bool = false,
+    ssd_streaming: bool = false,
+    ssd_streaming_cold: bool = false,
     inspect_only: bool = false,
     load_slice: bool = false,
     load_layer_start: u32 = 0,

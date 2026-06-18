@@ -188,6 +188,14 @@ pub const OpenOptions = struct {
     mtp_path: ?[:0]const u8 = null,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
+    /// SSD weight-streaming (issue #39): skip full model residency + warmup and
+    /// stream expert weights from disk, with an in-RAM cache. Lets DeepSeek-V4-Flash
+    /// run on machines whose RAM can't hold the full model. 0 cache fields = ds4 auto.
+    ssd_streaming: bool = false,
+    ssd_streaming_cold: bool = false,
+    ssd_streaming_cache_experts: u32 = 0,
+    ssd_streaming_cache_bytes: u64 = 0,
+    ssd_streaming_preload_experts: u32 = 0,
 };
 
 pub const Ds4Engine = struct {
@@ -217,6 +225,11 @@ pub const Ds4Engine = struct {
             .directional_steering_ffn = 0,
             .warm_weights = opts.warm_weights,
             .quality = opts.quality,
+            .ssd_streaming = opts.ssd_streaming,
+            .ssd_streaming_cold = opts.ssd_streaming_cold,
+            .ssd_streaming_cache_experts = opts.ssd_streaming_cache_experts,
+            .ssd_streaming_cache_bytes = opts.ssd_streaming_cache_bytes,
+            .ssd_streaming_preload_experts = opts.ssd_streaming_preload_experts,
         };
 
         var raw: ?*ffi.Engine = null;

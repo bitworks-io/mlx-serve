@@ -23,6 +23,11 @@ pub const VERSION: []const u8 = build_options.version;
 
 const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
+// --ssd-streaming (issue #39): ds4 weight-streaming toggle. Set during arg
+// parsing, read by the ds4 serve + offline open paths. Module-level to avoid
+// threading it through runDs4Serve's already-long parameter list.
+var ds4_ssd_streaming: bool = false;
+
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
@@ -112,6 +117,11 @@ fn printUsage(io: std.Io) void {
         \\                        Override when auto-detection is wrong
         \\                        (e.g. an unusual ds4 quant whose metadata
         \\                        layout differs).
+        \\  --ssd-streaming     ds4 / DeepSeek-V4-Flash only: stream expert
+        \\                        weights from SSD instead of holding the whole
+        \\                        model in RAM (skips full residency + warmup).
+        \\                        Use when the model is larger than available
+        \\                        memory. Ignored by the MLX + llama.cpp engines.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -404,6 +414,8 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--engine: expected one of {{auto, ds4, llama}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--ssd-streaming")) {
+            ds4_ssd_streaming = true;
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1042,6 +1054,7 @@ fn runDs4Offline(
     var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
         .backend = .metal,
         .warm_weights = true,
+        .ssd_streaming = ds4_ssd_streaming,
     }) catch |err| {
         log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
         return err;
@@ -1280,6 +1293,7 @@ fn runDs4Serve(
         // Iteration 2: tokenize cache for ds4 too.
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
+        .ds4_ssd_streaming = ds4_ssd_streaming,
     };
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{
