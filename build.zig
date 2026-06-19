@@ -188,6 +188,10 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c are
     // CLI/server-only and not part of the library path mlx-serve embeds.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
+    // SSD weight-streaming (issue #39): ds4_ssd.c is a standalone TU (#includes
+    // only ds4_ssd.h) implementing the streaming expert cache the engine_options
+    // ssd_streaming_* fields drive. Added upstream after the previous pin.
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_ssd.c"), .flags = c_flags });
 
     const objc_flags = &[_][]const u8{
         "-O3",

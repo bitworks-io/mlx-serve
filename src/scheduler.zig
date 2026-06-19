@@ -165,6 +165,9 @@ pub const LoadParams = struct {
     /// still moved onto the entry so server-side reads of `lm.config.?`
     /// (e.g. `eosTokenSlice`, `getEffectiveContextLength`) keep working.
     ds4_path: []const u8 = "",
+    /// SSD weight-streaming for the ds4 engine (issue #39): stream experts from
+    /// disk instead of requiring the full model resident in RAM.
+    ds4_ssd_streaming: bool = false,
     /// Like `ds4_path` but for the generic llama.cpp engine (any GGUF except
     /// DeepSeek-V4-Flash). The inference thread opens a `LlamaEngine` and
     /// installs it on the entry's `llama_engine` field. Mutually exclusive with
@@ -737,6 +740,9 @@ pub const LoadRequest = struct {
     /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
     model_dir: []const u8,
     drafter_dir: []const u8 = "",
+    /// SSD weight-streaming for cold-loaded ds4 models (issue #39). The CLI
+    /// startup path supplies this via LoadParams; cold-load defaults it off.
+    ds4_ssd_streaming: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     /// Default MTP draft depth (CLI --mtp-depth).
@@ -1562,6 +1568,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
         .backend = .metal,
         .warm_weights = true,
+        .ssd_streaming = params.ds4_ssd_streaming,
     });
     errdefer engine.close();
     log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
