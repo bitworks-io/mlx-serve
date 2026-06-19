@@ -277,6 +277,42 @@ class ServerManager: ObservableObject {
         }
     }
 
+    /// Builds the scrollable, selectable, monospaced log view shown in the
+    /// crash alert. Lines WRAP to the visible width instead of scrolling
+    /// horizontally — a horizontal scroller cuts off the tail of long
+    /// backtrace / exception lines, and the real crash cause (e.g.
+    /// "…execution failed: Insufficient Memory") sits at the far right where
+    /// it's unreachable. Factored out so the wrapping configuration is
+    /// unit-testable without running the modal alert.
+    @MainActor
+    static func makeCrashLogScrollView(log: String, width: CGFloat, height: CGFloat) -> NSScrollView {
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .bezelBorder
+        scroll.autohidesScrollers = false
+
+        let textView = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.string = log
+        // Wrap lines to the visible width instead of horizontal-scrolling.
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                  height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: scroll.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.scrollToEndOfDocument(nil)
+
+        scroll.documentView = textView
+        return scroll
+    }
+
     /// Modal alert for server crashes — surfaces the full stderr log in a
     /// scrollable, selectable text view so the user can copy/paste it into
     /// a bug report instead of digging through the menu-bar log icon.
@@ -287,28 +323,7 @@ class ServerManager: ObservableObject {
         alert.alertStyle = .warning
 
         // Scrollable, selectable, monospaced log view as the accessory.
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
-        scroll.borderType = .bezelBorder
-        scroll.autohidesScrollers = false
-
-        let textView = NSTextView(frame: scroll.bounds)
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        textView.string = log
-        textView.textContainer?.widthTracksTextView = false
-        textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.isHorizontallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.scrollToEndOfDocument(nil)
-
-        scroll.documentView = textView
-        alert.accessoryView = scroll
+        alert.accessoryView = Self.makeCrashLogScrollView(log: log, width: 640, height: 280)
 
         alert.addButton(withTitle: "Copy Log")
         alert.addButton(withTitle: "OK")

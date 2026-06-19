@@ -308,6 +308,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // failure doesn't end a long, productive turn.
         var retry = AgentEngine.AgentRetryBudget()
 
+        // Resolve the LAN IP once per turn (not per iteration): it's a getifaddrs
+        // enumeration that won't change mid-turn, and the agent loop rebuilds the
+        // system prompt on every tool round.
+        let lanIP = SystemGrounding.localIPAddress()
+
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
 
@@ -357,7 +362,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // surface the Mac's LAN IP so the agent reports reachable URLs for
             // anything it serves.
             var grounding = SystemGrounding.dateTimeLine()
-            let ipLine = SystemGrounding.localIPLine(ip: SystemGrounding.localIPAddress())
+            let ipLine = SystemGrounding.localIPLine(ip: lanIP)
             if !ipLine.isEmpty { grounding += " " + ipLine }
             systemPrompt = grounding + "\n\n" + systemPrompt
             // Voice mode: tools/thinking run silently; only the final answer is
@@ -708,7 +713,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 trigger: .dailyAt(hour: cal.component(.hour, from: now),
                                   minute: cal.component(.minute, from: now)),
                 scheduleText: "once", autonomy: .fullAuto, useMCP: useMCP, enabled: false,
-                originTelegramChatId: telegramChatId)
+                originTelegramChatId: telegramChatId, deleteAfterRun: true)
             scheduler.addTask(task)
             scheduler.runNow(task)
             return "✅ Created and started task “\(title)”. I'll \(willNotify) with the result when it finishes."

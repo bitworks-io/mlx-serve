@@ -544,11 +544,12 @@ struct ChatDetailView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
-                        ForEach(session?.messages ?? []) { message in
-                            // Hide tool response messages (role: system with toolCallId)
-                            if message.toolCallId == nil {
-                                MessageBubble(message: message)
-                                    .id(message.id)
+                        ForEach(ChatRowBuilder.rows(from: session?.messages ?? [])) { row in
+                            switch row {
+                            case .message(let m):
+                                MessageBubble(message: m).id(m.id)
+                            case .toolCall(let call, let results):
+                                ToolCallRow(call: call, results: results).id(call.id)
                             }
                         }
                         // Bottom anchor — its position relative to the scroll viewport
@@ -1668,6 +1669,121 @@ struct MessageBubble: View {
                 NSPasteboard.general.setString(message.content, forType: .string)
             }
         }
+    }
+}
+
+// MARK: - Tool-call grouping (collapse call + result into one collapsible row)
+
+/// A renderable transcript row: a normal message, or a tool call paired with its
+/// result(s) so they show as a single collapsible row instead of two bubbles.
+enum ChatRow: Identifiable {
+    case message(ChatMessage)
+    case toolCall(call: ChatMessage, results: [ChatMessage])
+    var id: UUID {
+        switch self {
+        case .message(let m): return m.id
+        case .toolCall(let c, _): return c.id
+        }
+    }
+}
+
+/// Folds the agent's separate "tool call" and "tool result" summary messages
+/// (both `isAgentSummary`) into one row: a `name(args)` header with the result(s)
+/// behind an expander. Pure → unit-tested in ChatRowBuilderTests.
+enum ChatRowBuilder {
+    /// A tool-RESULT summary is `**name** → output`; a tool-CALL summary is
+    /// `**name**(args)`. The `** → ` right after the bolded name discriminates
+    /// them (and also matches the "→ denied by user" result form).
+    static func isResultSummary(_ m: ChatMessage) -> Bool {
+        m.isAgentSummary && m.content.contains("** → ")
+    }
+    static func isCallSummary(_ m: ChatMessage) -> Bool {
+        m.isAgentSummary && !m.content.contains("** → ")
+    }
+
+    static func rows(from messages: [ChatMessage]) -> [ChatRow] {
+        // Same visibility rule as before: the raw tool-result messages
+        // (role .system carrying a toolCallId) stay hidden from the transcript.
+        let visible = messages.filter { $0.toolCallId == nil }
+        var rows: [ChatRow] = []
+        var i = 0
+        while i < visible.count {
+            let m = visible[i]
+            if isCallSummary(m) {
+                var results: [ChatMessage] = []
+                var j = i + 1
+                while j < visible.count, isResultSummary(visible[j]) {
+                    results.append(visible[j]); j += 1
+                }
+                rows.append(.toolCall(call: m, results: results))
+                i = j
+            } else {
+                rows.append(.message(m))
+                i += 1
+            }
+        }
+        return rows
+    }
+}
+
+/// One collapsible tool-call row: a `name(args)` header (tap to expand) with the
+/// tool result(s) revealed below. Replaces the old two-bubble call+result layout.
+private struct ToolCallRow: View {
+    let call: ChatMessage
+    let results: [ChatMessage]
+    @State private var expanded = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                } label: {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "wrench.and.screwdriver")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(Self.stripBold(call.content))
+                            .font(.caption.monospaced())
+                            .multilineTextAlignment(.leading)
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 6)
+                        if call.isStreaming {
+                            GeneratingIndicator()
+                        } else if !results.isEmpty {
+                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(results.isEmpty)
+
+                if expanded {
+                    ForEach(results) { r in
+                        Text(Self.stripBold(r.content))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(.controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+
+            Spacer(minLength: 60)
+        }
+    }
+
+    /// The summary strings use `**name**` markdown bold; the compact mono header
+    /// and body render as plain text, so strip the `**` markers.
+    static func stripBold(_ s: String) -> String {
+        s.replacingOccurrences(of: "**", with: "")
     }
 }
 

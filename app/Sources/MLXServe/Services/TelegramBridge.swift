@@ -39,6 +39,10 @@ final class TelegramBridge: ObservableObject {
     }
 
     @Published private(set) var status: Status = .off
+    /// True while a Telegram-driven turn is generating. `TaskScheduler.drain()`
+    /// reads this so a createTask spawned from a Telegram turn waits for that turn
+    /// to finish instead of running a second engine against the model concurrently.
+    @Published private(set) var isProcessing = false
 
     /// Owning app state. `unowned` because the bridge is a `lazy var` on
     /// `AppState` — it never outlives its owner.
@@ -49,6 +53,11 @@ final class TelegramBridge: ObservableObject {
     private lazy var engine = ChatTurnEngine(appState: appState)
 
     private var pollTask: Task<Void, Never>?
+    /// Debounces `reconcile()`: every Settings keystroke mutates `serverOptions`
+    /// (→ didSet → reconcile), so applying immediately would tear down + restart
+    /// the poll loop on each character of the bot token — hammering getMe with a
+    /// partial token (401 thrash). We coalesce to the last change after a quiet gap.
+    private var reconcileDebounce: Task<Void, Never>?
     /// Config the running loop was started with. Lets `reconcile()` no-op on the
     /// unrelated `ServerOptions` mutations that fire on every Settings keystroke.
     private var appliedConfig: ServerOptions.TelegramConfig?
@@ -82,6 +91,20 @@ final class TelegramBridge: ObservableObject {
     /// no-op when the fields that affect the connection (token, enabled) are
     /// unchanged — everything else is read live per message.
     func reconcile() {
+        // Debounce: rapid serverOptions mutations (typing/pasting the token) each
+        // fire didSet → reconcile; coalesce to the last change after a quiet gap so
+        // the poll loop isn't torn down + restarted per keystroke against a partial
+        // token (which would 401-thrash and write the prefs file every character).
+        reconcileDebounce?.cancel()
+        reconcileDebounce = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.reconcileDebounce = nil
+            self.applyReconcile()
+        }
+    }
+
+    private func applyReconcile() {
         let cfg = appState.serverOptions.telegram
 
         // Already running with the same connection params → nothing to restart.
@@ -100,6 +123,8 @@ final class TelegramBridge: ObservableObject {
     }
 
     func stop() {
+        reconcileDebounce?.cancel()
+        reconcileDebounce = nil
         pollTask?.cancel()
         pollTask = nil
         status = .off
@@ -113,7 +138,9 @@ final class TelegramBridge: ObservableObject {
         if Task.isCancelled { return }
         status = .listening(username: username)
 
-        var offset: Int64 = 0
+        // Resume from the last persisted offset so a restart doesn't re-fetch
+        // (and re-answer) updates Telegram hadn't yet had confirmed.
+        var offset: Int64 = Self.loadOffset(token: token)
         var backoffSeconds = 1
         while !Task.isCancelled {
             guard let url = TelegramAPI.getUpdatesURL(token: token, offset: offset, timeout: pollTimeout) else {
@@ -122,9 +149,19 @@ final class TelegramBridge: ObservableObject {
             }
             do {
                 let (data, response) = try await session.data(from: url)
-                if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+                let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? 200
+                if httpStatus == 401 {
                     status = .error("Invalid bot token (401) — re-check it in @BotFather.")
                     return
+                }
+                if httpStatus != 200 {
+                    // 429 / 409 / 5xx return instantly (no long-poll hold). Falling
+                    // through would parse {"ok":false} → no offset advance → tight
+                    // busy-loop hammering the API. Back off and retry instead.
+                    status = .error("Telegram API \(httpStatus) — retrying…")
+                    try? await Task.sleep(nanoseconds: UInt64(backoffSeconds) * 1_000_000_000)
+                    backoffSeconds = min(backoffSeconds * 2, 30)
+                    continue
                 }
                 // Recovered from a prior transient error.
                 if !status.isHealthy { status = .listening(username: username) }
@@ -136,6 +173,10 @@ final class TelegramBridge: ObservableObject {
                     if Task.isCancelled { return }
                     await handle(update, token: token)
                 }
+                // Persist AFTER handling: a crash mid-batch leaves the offset on the
+                // prior value so nothing is lost (at worst a handled item replays),
+                // while a clean restart resumes past the batch — no duplicate replies.
+                if let nextOffset { Self.saveOffset(nextOffset, token: token) }
             } catch {
                 if Task.isCancelled { return }
                 // Transient network issue — surface briefly, back off, retry.
@@ -144,6 +185,19 @@ final class TelegramBridge: ObservableObject {
                 backoffSeconds = min(backoffSeconds * 2, 30)
             }
         }
+    }
+
+    // Persisted poll offset, keyed by the bot id (the non-secret part of the token
+    // before ":") so changing tokens doesn't resume at a stale offset.
+    private static func offsetKey(token: String) -> String {
+        let botId = token.split(separator: ":").first.map(String.init) ?? "default"
+        return "telegramPollOffset.\(botId)"
+    }
+    private static func loadOffset(token: String) -> Int64 {
+        Int64(UserDefaults.standard.integer(forKey: offsetKey(token: token)))
+    }
+    private static func saveOffset(_ offset: Int64, token: String) {
+        UserDefaults.standard.set(offset, forKey: offsetKey(token: token))
     }
 
     // MARK: - Per-message handling
@@ -231,6 +285,8 @@ final class TelegramBridge: ObservableObject {
                 ) == .allow
             }
         )
+        isProcessing = true
+        defer { isProcessing = false }
         await awaitEngineIdle()
         return lastAssistantText(sessionId: sessionId)
     }

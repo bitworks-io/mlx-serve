@@ -334,6 +334,51 @@ extension ServerOptionsTests {
 }
 
 extension ServerOptionsTests {
+    /// CHARACTERIZATION GUARD for the migration-safe `init(from:)`: it decodes
+    /// key-by-key with `decodeIfPresent`, so a field added to the struct + CodingKeys
+    /// but FORGOTTEN in `init(from:)` would silently never load (decoded = default),
+    /// with no compiler error. Setting EVERY field to a non-default and asserting a
+    /// full round-trip catches exactly that — a forgotten key makes the decoded
+    /// value differ from the encoded one.
+    func testEveryFieldRoundTripsThroughCustomDecoder() throws {
+        var o = ServerOptions()
+        o.host = "127.0.0.1"
+        o.port = 9999
+        o.ctxSize = 65536
+        o.noVision = true
+        o.logLevel = .debug
+        o.requestTimeout = 600
+        o.enablePLD = false
+        o.pldDraftLen = 7
+        o.pldKeyLen = 4
+        o.drafterPath = "/x/y/drafter"
+        o.draftBlockSize = 8
+        o.maxConcurrent = 4
+        o.kvQuant = .int8
+        o.prefixCacheEntries = 8
+        o.prefixCacheMem = "4GB"
+        o.skipMemPreflight = true
+        o.llamaKvQuant = .q8
+        o.llamaCacheEntries = 4
+        o.tokenizeCacheEntries = 16
+        o.defaultMaxTokens = 8192
+        o.defaultTemperature = 0.42
+        o.defaultTopP = 0.5
+        o.defaultTopK = 40
+        o.defaultRepeatPenalty = 1.2
+        o.defaultPresencePenalty = 0.3
+        o.defaultReasoningBudget = 2048
+        o.defaultEnableThinking = true
+        o.perRequestEnablePLD = .on
+        o.perRequestEnableDrafter = .off
+        o.telegram = .init(enabled: true, botToken: "1:abc", agentMode: true,
+                           useMCP: true, enableThinking: true, allowedChatIds: [7, 8])
+
+        XCTAssertNotEqual(o, ServerOptions(), "sanity: every field moved off its default")
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
+        XCTAssertEqual(o, decoded, "a field missing from the custom init(from:) would revert to its default here")
+    }
+
     /// Slider arithmetic leaves float dirt (0.8 − 0.1 = 0.7000000000000001);
     /// argv must carry the clean decimal (seen verbatim in `ps` output live).
     func testSamplingFlagFormattingIsClean() {

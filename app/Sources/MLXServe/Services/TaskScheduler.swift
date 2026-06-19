@@ -237,8 +237,11 @@ final class TaskScheduler: ObservableObject {
 
     private func drain() {
         guard !running, !queue.isEmpty else { return }
-        // Interactive chat wins the single generation slot — wait for it to go idle.
-        if appState.chatEngine.isGenerating {
+        // Interactive turns win the single generation slot — wait for them to go
+        // idle. That's the in-app chat engine AND the Telegram bridge's engine
+        // (e.g. a createTask spawned from a Telegram turn must not run a second
+        // engine against the model while that turn is still generating).
+        if appState.chatEngine.isGenerating || appState.telegramBridge.isProcessing {
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 self?.drain()
@@ -556,6 +559,10 @@ final class TaskScheduler: ObservableObject {
                run.status == .completed || run.status == .failed {
                 appState.telegramBridge.deliverTaskResult(chatId: chatId, task: task, run: run)
             }
+            // One-shot ("run now") tasks created by the agent clean themselves up so
+            // they don't pile up as disabled entries in the Tasks list — the result
+            // already went to Telegram + the desktop notification above.
+            if task.deleteAfterRun { deleteTask(taskId) }
         }
     }
 

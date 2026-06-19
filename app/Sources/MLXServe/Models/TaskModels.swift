@@ -72,6 +72,10 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
     /// Non-nil → each finished run is also pushed back to that chat (in addition
     /// to the desktop notification). nil for tasks created in the app UI.
     var originTelegramChatId: Int64?
+    /// One-shot "run now" tasks (the createTask tool with no schedule) set this so
+    /// the scheduler removes them from the catalog once their run finishes, instead
+    /// of leaving a disabled entry cluttering the Tasks list.
+    var deleteAfterRun: Bool
 
     init(id: UUID = UUID(),
          title: String,
@@ -87,7 +91,8 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
          lastRunAt: Date? = nil,
          nextFireAt: Date? = nil,
          workingDirectory: String? = nil,
-         originTelegramChatId: Int64? = nil) {
+         originTelegramChatId: Int64? = nil,
+         deleteAfterRun: Bool = false) {
         self.id = id
         self.title = title
         self.goal = goal
@@ -103,12 +108,13 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
         self.nextFireAt = nextFireAt
         self.workingDirectory = workingDirectory
         self.originTelegramChatId = originTelegramChatId
+        self.deleteAfterRun = deleteAfterRun
     }
 
     enum CodingKeys: String, CodingKey {
         case id, title, goal, trigger, scheduleText, autonomy, modelPath, useMCP
         case enabled, catchUpMissed, createdAt, lastRunAt, nextFireAt, workingDirectory
-        case originTelegramChatId
+        case originTelegramChatId, deleteAfterRun
     }
 
     init(from decoder: Decoder) throws {
@@ -128,6 +134,7 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
         nextFireAt = try c.decodeIfPresent(Date.self, forKey: .nextFireAt)
         workingDirectory = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
         originTelegramChatId = try c.decodeIfPresent(Int64.self, forKey: .originTelegramChatId)
+        deleteAfterRun = try c.decodeIfPresent(Bool.self, forKey: .deleteAfterRun) ?? false
     }
 }
 

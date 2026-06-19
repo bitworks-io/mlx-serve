@@ -1,5 +1,6 @@
 import XCTest
 import Combine
+import AppKit
 @testable import MLXCore
 
 /// Unit tests for the pure buffer-trim helper that backs `ServerManager`'s
@@ -217,5 +218,46 @@ final class ServerLogBufferTests: XCTestCase {
 
     func testSummarizeCrashEmptyFallsBackToExitCode() {
         XCTAssertEqual(ServerManager.summarizeCrash("   \n  ", exitCode: 9), "exit code 9")
+    }
+
+    // MARK: - Crash log view (wrapping, not horizontal scroll)
+    //
+    // The crash alert used to configure its log text view for horizontal
+    // scrolling (`isHorizontallyResizable = true`, infinite container width),
+    // so long backtrace / exception lines ran off the right edge and the
+    // tail — where the real cause lives ("…execution failed: Insufficient
+    // Memory") — got cut off even when scrolling. The fix wraps to the
+    // visible width. These tests pin the wrapping configuration.
+
+    @MainActor
+    func testCrashLogViewWrapsInsteadOfScrollingHorizontally() {
+        let scroll = ServerManager.makeCrashLogScrollView(log: "hello", width: 640, height: 280)
+        XCTAssertFalse(scroll.hasHorizontalScroller,
+                       "Crash log must not offer a horizontal scroller")
+        XCTAssertTrue(scroll.hasVerticalScroller)
+        guard let textView = scroll.documentView as? NSTextView else {
+            return XCTFail("documentView must be an NSTextView")
+        }
+        XCTAssertFalse(textView.isHorizontallyResizable,
+                       "A horizontally-resizable text view scrolls instead of wrapping")
+        XCTAssertEqual(textView.textContainer?.widthTracksTextView, true,
+                       "Container width must track the text view so lines wrap to it")
+        // Container width must be bounded to the visible width, not infinite.
+        if let w = textView.textContainer?.containerSize.width {
+            XCTAssertLessThan(w, CGFloat.greatestFiniteMagnitude,
+                              "An infinite container width is exactly the horizontal-scroll bug")
+        }
+    }
+
+    @MainActor
+    func testCrashLogViewIsSelectableAndHoldsFullLog() {
+        let log = String(repeating: "frame line that is quite long\n", count: 50)
+        let scroll = ServerManager.makeCrashLogScrollView(log: log, width: 640, height: 280)
+        guard let textView = scroll.documentView as? NSTextView else {
+            return XCTFail("documentView must be an NSTextView")
+        }
+        XCTAssertTrue(textView.isSelectable, "User must be able to select & copy the log")
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertEqual(textView.string, log, "Full log must be present for copy")
     }
 }

@@ -1718,18 +1718,25 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 /// block a load.
 fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
-    const headroom: u64 = weights_bytes / 12 + 256 * 1024 * 1024;
+    // Headroom over the weights for warmup compute buffers + a baseline KV cache.
+    // `avail_bytes` (status.getAvailableMemBytes) now excludes the resident anon
+    // set — an already-loaded model counts as used while file cache counts as free
+    // — so this margin can be generous without wrongly refusing a fresh load.
+    // CAVEAT: the KV cache scales with --ctx-size, which this guard doesn't see;
+    // a very large context can still exceed this margin (follow-up: plumb ctx +
+    // kv_quant to size KV precisely). Bypass with MLX_SERVE_SKIP_MEM_PREFLIGHT=1.
+    const headroom: u64 = weights_bytes / 8 + 1024 * 1024 * 1024;
     return avail_bytes < weights_bytes + headroom;
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
-    // Regression: a 6.9 GB 4-bit model into 8.3 GB free on a 16 GB Mac. The
-    // original weights/7 + 1 GB headroom demanded 8.9 GB and wrongly refused a
-    // load that macOS reclaims file cache to satisfy; weights/12 + 0.25 GB needs
-    // ~7.7 GB → loads. macOS reclaims the small gap from inactive/file-cache pages.
-    try std.testing.expect(!memInsufficientForLoad(6900 * MB, 8300 * MB));
+    // A 6.9 GB 4-bit model with ~10 GB genuinely available — file cache is
+    // excluded from the new anon-aware available figure (computeAvailableBytes),
+    // so this is what a 16 GB Mac actually reports pre-load. Needs ~8.8 GB
+    // (weights + weights/8 + 1 GB for warmup + baseline KV) → loads.
+    try std.testing.expect(!memInsufficientForLoad(6900 * MB, 10 * GB));
     // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~46, refuse.
     try std.testing.expect(memInsufficientForLoad(42 * GB, 44 * GB));
     // Plenty of headroom → allow.
