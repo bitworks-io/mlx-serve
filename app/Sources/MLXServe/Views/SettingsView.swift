@@ -45,6 +45,13 @@ struct SettingsView: View {
                         RequestDefaultsSectionContent()
                     }
 
+                    SettingsSection(
+                        title: "Messaging — Telegram bot",
+                        subtitle: "Message your local model from your phone via a Telegram bot. No public URL or port-forwarding needed — the app long-polls Telegram over your normal internet connection, so it works behind home Wi-Fi."
+                    ) {
+                        MessagingSectionContent(bridge: appState.telegramBridge)
+                    }
+
                     ResetDefaultsFooter()
                 }
                 .padding(.horizontal, 24)
@@ -1185,5 +1192,149 @@ private struct RequestDefaultsSectionContent: View {
             best = i
         }
         return best
+    }
+}
+
+// MARK: - Messaging (Telegram bot) section
+
+/// Settings for the Telegram bot bridge. The whole thing is two steps for the
+/// user: create a bot in @BotFather, paste the token, flip the switch — then
+/// message the bot once to lock it to your chat (trust-on-first-use). `@Observed`
+/// on the live bridge so the status pill updates as it connects.
+private struct MessagingSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @ObservedObject var bridge: TelegramBridge
+
+    private var telegram: ServerOptions.TelegramConfig { appState.serverOptions.telegram }
+
+    var body: some View {
+        // Live status pill (only meaningful once enabled).
+        if telegram.enabled {
+            HStack(spacing: 8) {
+                Text("Status")
+                    .font(.body)
+                Spacer(minLength: 12)
+                statusPill
+            }
+        }
+
+        SettingsRow(
+            title: "Enable Telegram bot",
+            explainer: "Long-polls Telegram for messages and relays them to your local model. Needs a bot token (below) and a running model."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.telegram.enabled)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "Bot token",
+            explainer: "Paste the token @BotFather gives you after /newbot. Stored locally on this Mac and sent only to Telegram's API."
+        ) {
+            TextField("", text: $appState.serverOptions.telegram.botToken,
+                      prompt: Text("123456:ABC-DEF…"))
+                .textFieldStyle(.roundedBorder)
+                .font(.body.monospaced())
+                .frame(width: 260)
+        }
+
+        SettingsRow(
+            title: "Agent mode (tools)",
+            explainer: "OFF = plain chat (safe). ON = the bot can run shell commands and read/write files on this Mac, triggered from your phone. Confined to ~/.mlx-serve/telegram-workspace. Only enable if you understand the risk — anyone who can message the locked chat gets this power."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.telegram.agentMode)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "MCP tools",
+            explainer: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Agent mode. Servers start on first use."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.telegram.useMCP)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "Enable thinking",
+            explainer: "Send reasoning-enabled requests for models that support it. The bot replies with the final answer only (no thinking trace)."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.telegram.enableThinking)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        // Allow-list / lock control.
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Locked to")
+                    .font(.body)
+                Spacer(minLength: 12)
+                HStack(spacing: 8) {
+                    Text(lockLabel)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(telegram.allowedChatIds.isEmpty ? .secondary : .primary)
+                    Button("Reset lock") {
+                        appState.serverOptions.telegram.allowedChatIds = []
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(telegram.allowedChatIds.isEmpty)
+                }
+            }
+            Text("The first chat that messages the bot is adopted as the owner; everyone else is refused. Reset to hand the bot to a different chat.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        Divider()
+
+        // Setup steps.
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Setup")
+                .font(.caption.weight(.semibold))
+            Text("1. In Telegram, open @BotFather and send /newbot.")
+                .font(.caption2).foregroundStyle(.secondary)
+            Text("2. Copy the token it gives you and paste it above.")
+                .font(.caption2).foregroundStyle(.secondary)
+            Text("3. Turn on “Enable Telegram bot”, then message your bot once to lock it to your chat.")
+                .font(.caption2).foregroundStyle(.secondary)
+            Link("Open @BotFather ↗", destination: URL(string: "https://t.me/botfather")!)
+                .font(.caption2)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.top, 2)
+    }
+
+    private var lockLabel: String {
+        let ids = telegram.allowedChatIds
+        switch ids.count {
+        case 0: return "no chat yet (first to message wins)"
+        case 1: return "chat \(ids[0])"
+        default: return "\(ids.count) chats"
+        }
+    }
+
+    @ViewBuilder
+    private var statusPill: some View {
+        let (text, color): (String, Color) = {
+            switch bridge.status {
+            case .off:               return ("Off", .secondary)
+            case .connecting:        return ("Connecting…", .orange)
+            case .listening(let u):  return (u.map { "Listening as @\($0)" } ?? "Listening", .green)
+            case .error(let m):      return (m, .red)
+            }
+        }()
+        Text(text)
+            .font(.caption2.monospaced())
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12))
+            .clipShape(Capsule())
+            .lineLimit(2)
+            .frame(maxWidth: 280, alignment: .trailing)
     }
 }

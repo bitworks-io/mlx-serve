@@ -17,8 +17,12 @@ final class VoiceModeControllerTests: XCTestCase {
         var onSpeechStarted: (() -> Void)?
         var onPartialTranscript: ((String) -> Void)?
         var onFinalTranscript: ((String) -> Void)?
+        var onUnrecognizedSpeech: (() -> Void)?
         var onError: ((String) -> Void)?
         var authorized = true
+        /// When set, `preflight()` returns this verbatim so tests can exercise the
+        /// dictation-model-missing path; otherwise it derives from `authorized`.
+        var preflightSnapshot: VoicePreflight.Snapshot?
         private(set) var startCount = 0
         private(set) var stopCount = 0
         /// Ordered log of mic lifecycle calls, so tests can assert a *clean*
@@ -26,6 +30,11 @@ final class VoiceModeControllerTests: XCTestCase {
         /// real `AVAudioEngine` tap and wedges the UI).
         private(set) var events: [String] = []
         func requestAuthorization() async -> Bool { authorized }
+        func preflight() async -> VoicePreflight.Snapshot {
+            preflightSnapshot ?? VoicePreflight.Snapshot(
+                micAuthorized: authorized, speechAuthorized: authorized,
+                onDeviceAvailable: true, locale: "en_US")
+        }
         func start() throws { startCount += 1; events.append("start") }
         func stop() { stopCount += 1; events.append("stop") }
     }
@@ -167,6 +176,67 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertTrue(ok)
         XCTAssertEqual(c.state, .listening)
         XCTAssertEqual(rec.startCount, 1)
+        XCTAssertNil(c.setupIssue, "a clean start clears any setup notice")
+    }
+
+    func testBeginSurfacesMicrophoneIssueWhenPermissionDenied() async {
+        let (c, rec, _) = make()
+        rec.authorized = false
+        let ok = await c.begin()
+        XCTAssertFalse(ok)
+        XCTAssertEqual(c.setupIssue, .microphoneDenied, "denied permission → non-invasive notice, not a dead mic")
+        XCTAssertEqual(rec.startCount, 0, "mic must NOT open when a prerequisite is missing")
+    }
+
+    func testBeginSurfacesDictationIssueWhenOnDeviceModelMissing() async {
+        // Pre-flight catches a model that was never downloaded.
+        let (c, rec, _) = make()
+        rec.preflightSnapshot = VoicePreflight.Snapshot(
+            micAuthorized: true, speechAuthorized: true, onDeviceAvailable: false, locale: "en_US")
+        let ok = await c.begin()
+        XCTAssertFalse(ok)
+        XCTAssertEqual(c.setupIssue, .dictationUnavailable(locale: "en_US"))
+        XCTAssertEqual(rec.startCount, 0)
+    }
+
+    /// The Dictation-switch-OFF case the user hit: pre-flight passes (model is
+    /// installed → `supportsOnDeviceRecognition` true), the mic hears speech, but
+    /// recognition returns nothing. Two empty-speech turns → surface the notice.
+    func testRepeatedUnrecognizedSpeechSurfacesDictationNotice() async {
+        let (c, rec, _) = make()
+        _ = await c.begin()
+        XCTAssertEqual(c.state, .listening)
+        XCTAssertNil(c.setupIssue)
+
+        rec.onUnrecognizedSpeech?()            // one stray empty turn → no nag yet
+        XCTAssertNil(c.setupIssue)
+        XCTAssertTrue(c.isActive)
+
+        rec.onUnrecognizedSpeech?()            // second in a row → notice + stop
+        if case .dictationUnavailable = c.setupIssue {} else {
+            XCTFail("expected dictationUnavailable, got \(String(describing: c.setupIssue))")
+        }
+        XCTAssertFalse(c.isActive, "a dead recognizer should stop, not keep a hot mic")
+    }
+
+    /// A successful transcription clears the empty-speech streak so an earlier
+    /// stray miss can't combine with a much-later one to false-trigger.
+    func testSuccessfulTranscriptResetsUnrecognizedStreak() async {
+        let (c, rec, _, _, _) = makeRunnable()
+        _ = await c.begin()
+        rec.onUnrecognizedSpeech?()            // 1
+        rec.onFinalTranscript?("hello there")  // success → reset
+        rec.onUnrecognizedSpeech?()            // 1 again, not 2
+        XCTAssertNil(c.setupIssue)
+    }
+
+    func testEndClearsSetupIssue() async {
+        let (c, rec, _) = make()
+        rec.authorized = false
+        _ = await c.begin()
+        XCTAssertNotNil(c.setupIssue)
+        c.end()
+        XCTAssertNil(c.setupIssue)
     }
 
     func testBeginFailsWhenPermissionDenied() async {
@@ -174,7 +244,9 @@ final class VoiceModeControllerTests: XCTestCase {
         rec.authorized = false
         let ok = await c.begin()
         XCTAssertFalse(ok)
-        XCTAssertEqual(c.state, .error("Microphone or speech permission denied."))
+        // The pre-flight now reports the precise missing prerequisite (here, mic)
+        // rather than a vague combined string.
+        XCTAssertEqual(c.state, .error(VoicePreflight.shortMessage(for: .microphoneDenied)))
     }
 
     func testFinalTranscriptSubmitsVoiceTurnAndEntersThinking() async {

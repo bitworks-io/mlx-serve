@@ -22,6 +22,20 @@ final class VoiceModeController: ObservableObject {
     /// this; it stays true through a recoverable error so the panel can show it.
     @Published private(set) var isActive = false
 
+    /// Set when enabling Voice hit a missing prerequisite (mic / speech
+    /// permission, or the on-device dictation model). Drives a non-invasive
+    /// notice + "Open Settings" button in the voice panel; cleared on a clean
+    /// start or on `end()`. nil = nothing to nag about.
+    @Published private(set) var setupIssue: VoicePreflight.Issue?
+
+    /// Consecutive turns where the mic heard speech but recognition returned
+    /// nothing — the runtime signature of on-device dictation being off (the
+    /// pre-flight can't see this; `supportsOnDeviceRecognition` stays true).
+    private var unrecognizedSpeechStreak = 0
+    /// Surface the notice after this many empty-speech turns in a row — one stray
+    /// noise shouldn't nag; two in a row means recognition really isn't working.
+    private static let unrecognizedSpeechLimit = 2
+
     /// Hands-free agent runs: defaults ON for the tray voice assistant (it's
     /// hands-free by design). When OFF, each tool call surfaces a `pendingApproval`
     /// card in the panel/orb and the turn waits until the user allows or denies.
@@ -200,6 +214,7 @@ final class VoiceModeController: ObservableObject {
         recognizer.onSpeechStarted = { [weak self] in self?.handleSpeechStarted() }
         recognizer.onPartialTranscript = { [weak self] t in self?.partialTranscript = t }
         recognizer.onFinalTranscript = { [weak self] t in self?.handleFinalTranscript(t) }
+        recognizer.onUnrecognizedSpeech = { [weak self] in self?.handleUnrecognizedSpeech() }
         recognizer.onError = { [weak self] m in self?.send(.failed(m)) }
         synthesizer.onQueueDrained = { [weak self] in self?.handleQueueDrained() }
     }
@@ -209,15 +224,34 @@ final class VoiceModeController: ObservableObject {
     /// Authorize, open the mic and enter the listening state. Returns false if
     /// permission was denied or the mic couldn't start.
     func begin() async -> Bool {
-        guard await recognizer.requestAuthorization() else {
-            send(.failed("Microphone or speech permission denied."))
+        // Non-invasive pre-flight: check the three prerequisites (mic + speech
+        // permission, on-device dictation model) and, if one is missing, surface
+        // a precise notice in the panel instead of opening a dead mic. No modal.
+        let snapshot = await recognizer.preflight()
+        if let issue = VoicePreflight.firstIssue(snapshot) {
+            setupIssue = issue
+            send(.failed(VoicePreflight.shortMessage(for: issue)))
             return false
         }
+        setupIssue = nil
+        unrecognizedSpeechStreak = 0
         send(.start)
         isActive = true
         disarmFollowUp()              // a fresh session always starts behind the wake word
         startListening()
         return state == .listening
+    }
+
+    /// The mic heard speech but recognition produced nothing. A one-off is just
+    /// noise; a couple in a row means on-device dictation is off/unavailable — so
+    /// we stop the dead session and show the actionable notice (with the same
+    /// "Open Keyboard Settings" affordance as the pre-flight).
+    private func handleUnrecognizedSpeech() {
+        guard isActive else { return }
+        unrecognizedSpeechStreak += 1
+        guard unrecognizedSpeechStreak >= Self.unrecognizedSpeechLimit else { return }
+        end()
+        setupIssue = .dictationUnavailable(locale: Locale.current.identifier)
     }
 
     /// Close voice mode and release all audio resources.
@@ -233,6 +267,7 @@ final class VoiceModeController: ObservableObject {
         level = 0
         isMuted = false
         isActive = false
+        setupIssue = nil
         disarmFollowUp()
     }
 
@@ -379,6 +414,7 @@ final class VoiceModeController: ObservableObject {
         guard state == .listening || state == .recognizing else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        unrecognizedSpeechStreak = 0   // recognition is working — clear the streak
 
         guard let query = wakeWordGate(trimmed) else {
             // Ambient speech we weren't addressed in, or a bare wake phrase that

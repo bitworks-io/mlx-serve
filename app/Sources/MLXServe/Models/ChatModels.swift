@@ -13,6 +13,11 @@ struct ChatSession: Identifiable, Codable {
     /// and never persisted to chat-history.json — their transcript lives under
     /// ~/.mlx-serve/tasks/<taskId>/<runId>/transcript.json instead.
     var taskRunId: UUID?
+    /// True marks this as a transient vehicle for an external messaging bridge
+    /// (e.g. the Telegram bot). Like task-run sessions these are kept out of the
+    /// chat sidebar and never persisted to chat-history.json — the conversation
+    /// lives on the messaging platform, not in the app's chat list.
+    var isExternalBridge: Bool
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -23,10 +28,11 @@ struct ChatSession: Identifiable, Codable {
         self.mode = .chat
         self.workingDirectory = ChatSession.defaultWorkingDirectory
         self.taskRunId = nil
+        self.isExternalBridge = false
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, taskRunId
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, taskRunId, isExternalBridge
     }
 
     init(from decoder: Decoder) throws {
@@ -38,6 +44,7 @@ struct ChatSession: Identifiable, Codable {
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         mode = try c.decodeIfPresent(ChatMode.self, forKey: .mode) ?? .chat
         taskRunId = try c.decodeIfPresent(UUID.self, forKey: .taskRunId)
+        isExternalBridge = try c.decodeIfPresent(Bool.self, forKey: .isExternalBridge) ?? false
         // Backfill: sessions saved before workingDirectory had a default come back as nil. Anchor them
         // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
         let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)

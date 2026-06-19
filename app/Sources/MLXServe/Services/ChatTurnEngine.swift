@@ -59,6 +59,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// folder attached — advertises the searchDocuments tool and, with both
         /// Agent and MCP off, routes the turn through the loop in docs-only mode.
         var documentIndex: DocumentIndex? = nil
+        /// Set when this turn is driven by the Telegram bridge — the originating
+        /// chat id. Threaded into any `createTask` the agent makes so the task's
+        /// result is pushed back to that chat. nil for in-app / voice turns.
+        var telegramChatId: Int64? = nil
     }
 
     // MARK: - Convenience accessors
@@ -349,8 +353,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             }
             // Ground every agent turn in the wall clock so "what time/date is it"
             // is answered from reality, not a hallucinated guess (and so recency
-            // reasoning is correct). Voice and text agents both benefit.
-            systemPrompt = SystemGrounding.dateTimeLine() + "\n\n" + systemPrompt
+            // reasoning is correct). Voice and text agents both benefit. Also
+            // surface the Mac's LAN IP so the agent reports reachable URLs for
+            // anything it serves.
+            var grounding = SystemGrounding.dateTimeLine()
+            let ipLine = SystemGrounding.localIPLine(ip: SystemGrounding.localIPAddress())
+            if !ipLine.isEmpty { grounding += " " + ipLine }
+            systemPrompt = grounding + "\n\n" + systemPrompt
             // Voice mode: tools/thinking run silently; only the final answer is
             // spoken, so steer it to a short, speakable reply (no URLs/Markdown).
             if config.voiceStyle { systemPrompt = VoicePrompt.decorate(systemPrompt) }
@@ -610,7 +619,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     repetition: repetition, iteration: iteration,
                     agentMemory: appState.agentMemory,
                     mcpRouter: mcpManager,
-                    documentIndex: config.documentIndex
+                    documentIndex: config.documentIndex,
+                    createTask: { [weak self] goal, schedule in
+                        await self?.createTaskFromAgent(
+                            goal: goal, schedule: schedule,
+                            telegramChatId: config.telegramChatId
+                        ) ?? "Error: task creation unavailable."
+                    }
                 )
                 roundOutputs.append(result.output)
 
@@ -659,6 +674,53 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // Max iterations reached
         let msg = ChatMessage(role: .assistant, content: "(Agent stopped after \(maxIterations) tool call rounds)")
         appState.appendMessage(to: sessionId, message: msg)
+    }
+
+    // MARK: - createTask tool (agent-scheduled background tasks)
+
+    /// Backs the agent's `createTask` tool: build a `ScheduledTask` from a goal +
+    /// optional natural-language schedule and hand it to the `TaskScheduler`. A
+    /// one-shot ("now" / omitted) is created disabled and run immediately; a
+    /// recurring schedule is added enabled and fires on its own. `telegramChatId`
+    /// (set on Telegram-driven turns) is stamped on the task so each finished run
+    /// reports back to that chat. Returns a short confirmation / error string for
+    /// the model to relay.
+    func createTaskFromAgent(goal: String, schedule: String?, telegramChatId: Int64?) async -> String {
+        let trimmedGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedGoal.isEmpty else {
+            return "Error: createTask needs a non-empty \"goal\" — the full instruction the task should carry out (it has no memory of this conversation)."
+        }
+        let scheduler = appState.taskScheduler
+        let title = TaskScheduler.deriveTitle(from: trimmedGoal)
+        let willNotify = telegramChatId != nil ? "message you here" : "notify you on the desktop"
+        // Inherit MCP exposure from the originating context: the bot's MCP toggle
+        // for Telegram-created tasks, the app's MCP mode for in-app ones.
+        let useMCP = telegramChatId != nil ? appState.serverOptions.telegram.useMCP : appState.mcpMode
+
+        switch TaskScheduler.scheduleIntent(schedule) {
+        case .invalid:
+            return "Couldn't understand the schedule “\(schedule ?? "")”. Use a phrase like “every day at 9am”, “every hour”, or “Mon Wed Fri at 8am” — or omit it / say “now” to run once immediately."
+        case .once:
+            let now = Date()
+            let cal = Calendar.current
+            let task = ScheduledTask(
+                title: title, goal: trimmedGoal,
+                trigger: .dailyAt(hour: cal.component(.hour, from: now),
+                                  minute: cal.component(.minute, from: now)),
+                scheduleText: "once", autonomy: .fullAuto, useMCP: useMCP, enabled: false,
+                originTelegramChatId: telegramChatId)
+            scheduler.addTask(task)
+            scheduler.runNow(task)
+            return "✅ Created and started task “\(title)”. I'll \(willNotify) with the result when it finishes."
+        case .recurring(let trigger):
+            let task = ScheduledTask(
+                title: title, goal: trimmedGoal, trigger: trigger,
+                scheduleText: schedule?.trimmingCharacters(in: .whitespacesAndNewlines),
+                autonomy: .fullAuto, useMCP: useMCP, enabled: true,
+                originTelegramChatId: telegramChatId)
+            scheduler.addTask(task)
+            return "✅ Scheduled task “\(title)” to run \(ScheduleParser.describe(trigger)). I'll \(willNotify) with each result."
+        }
     }
 
     // MARK: - Tool JSON + multimodal content (relocated from ChatDetailView)

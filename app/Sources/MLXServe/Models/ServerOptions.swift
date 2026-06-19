@@ -91,6 +91,13 @@ struct ServerOptions: Codable, Equatable {
     var perRequestEnablePLD: TriState = .auto
     var perRequestEnableDrafter: TriState = .auto
 
+    // MARK: Messaging bridge (app-level — NOT a server-launch flag, NOT per-request)
+    /// Telegram bot bridge: message your local model from your phone. The bridge
+    /// runs *inside* the app (long-polls Telegram over outbound HTTPS), so it is
+    /// deliberately excluded from `serverLaunchEquals` — toggling it must never
+    /// prompt a server restart.
+    var telegram: TelegramConfig = TelegramConfig()
+
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
@@ -164,6 +171,57 @@ struct ServerOptions: Codable, Equatable {
             case .off:  return false
             }
         }
+    }
+
+    /// Telegram bot bridge settings. The user creates the bot via @BotFather
+    /// (`/newbot`) and pastes the token here. The bridge long-polls Telegram
+    /// (outbound HTTPS only — no public URL or port-forward, so it works behind
+    /// home NAT). `allowedChatIds` locks the bot to specific chats; empty means
+    /// "adopt the first chat that messages" (trust-on-first-use), so setup is
+    /// just: paste token, message the bot once.
+    struct TelegramConfig: Codable, Equatable {
+        var enabled: Bool = false
+        var botToken: String = ""
+        /// false = plain chat (default, safe). true = the full agent loop with
+        /// tools (shell / file / web) executing on this Mac, driven from the
+        /// phone. Opt-in; the Settings UI warns about the implications.
+        var agentMode: Bool = false
+        /// Expose the user's enabled MCP servers to the bot (and to the tasks it
+        /// creates). Opt-in; works alongside or independently of `agentMode`.
+        var useMCP: Bool = false
+        var enableThinking: Bool = false
+        /// Telegram chat IDs allowed to use the bot. Empty = adopt the first
+        /// chat that messages (TOFU); the bridge appends the adopted id here.
+        var allowedChatIds: [Int64] = []
+
+        /// True when the config is actually runnable (enabled + a non-blank token).
+        var isRunnable: Bool {
+            enabled && !botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        /// The bot token with surrounding whitespace stripped — what the bridge
+        /// actually sends to the Telegram API (users paste with trailing newlines).
+        var trimmedToken: String {
+            botToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        /// Access decision for an incoming chat id. Pure — drives the bridge's
+        /// gate and is unit-tested without any network.
+        func access(forChatId chatId: Int64) -> TelegramAccess {
+            if allowedChatIds.contains(chatId) { return .allowed }
+            if allowedChatIds.isEmpty { return .adopt }
+            return .rejected
+        }
+    }
+
+    /// Outcome of the bot's per-message access check. See `TelegramConfig.access`.
+    enum TelegramAccess: Equatable {
+        /// Chat is on the allow-list — answer it.
+        case allowed
+        /// No allow-list yet — adopt this chat (add to `allowedChatIds`) then answer.
+        case adopt
+        /// An allow-list exists and this chat isn't on it — refuse.
+        case rejected
     }
 
     // MARK: Restart-detection helpers
@@ -335,6 +393,76 @@ struct ServerOptions: Codable, Equatable {
     func save() {
         guard let data = try? JSONEncoder().encode(self) else { return }
         UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+}
+
+// MARK: - Migration-safe decoding
+
+extension ServerOptions {
+    /// Forward/backward-compatible decode: every key is optional, falling back
+    /// to the `ServerOptions()` default when absent.
+    ///
+    /// The COMPILER-SYNTHESIZED `init(from:)` throws `keyNotFound` the moment a
+    /// stored blob is missing ANY key — which is exactly what happens to an
+    /// existing user's saved options every time a new field ships. Because
+    /// `load()` wraps the decode in `try?` and falls back to `ServerOptions()`,
+    /// that throw silently RESETS the user's entire tuning to defaults on
+    /// upgrade. Decoding key-by-key with `decodeIfPresent` (defaults supplied by
+    /// delegating to the no-arg init first) keeps old blobs valid and makes
+    /// every future field addition migration-safe automatically. Declared in an
+    /// extension so the memberwise / no-arg initializers stay synthesized.
+    /// `encode(to:)` and `CodingKeys` remain compiler-synthesized, so round-trip
+    /// + Equatable are unchanged (see `testRoundTripCodable`).
+    init(from decoder: Decoder) throws {
+        self.init()   // every property seeded with its default
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(String.self, forKey: .host) { host = v }
+        if let v = try c.decodeIfPresent(UInt16.self, forKey: .port) { port = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .ctxSize) { ctxSize = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .noVision) { noVision = v }
+        if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .drafterPath) { drafterPath = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
+        if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
+        if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .defaultMaxTokens) { defaultMaxTokens = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTemperature) { defaultTemperature = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTopP) { defaultTopP = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .defaultTopK) { defaultTopK = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultRepeatPenalty) { defaultRepeatPenalty = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultPresencePenalty) { defaultPresencePenalty = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .defaultReasoningBudget) { defaultReasoningBudget = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .defaultEnableThinking) { defaultEnableThinking = v }
+        if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnablePLD) { perRequestEnablePLD = v }
+        if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnableDrafter) { perRequestEnableDrafter = v }
+        if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
+    }
+}
+
+extension ServerOptions.TelegramConfig {
+    /// Tolerant decode (same rationale as `ServerOptions.init(from:)`): a stored
+    /// telegram blob written before a field existed must decode with that field
+    /// defaulted, not throw — a throw here propagates up through ServerOptions
+    /// and `load()` silently resets the user's entire config (token included).
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .botToken) { botToken = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .agentMode) { agentMode = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useMCP) { useMCP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) { enableThinking = v }
+        if let v = try c.decodeIfPresent([Int64].self, forKey: .allowedChatIds) { allowedChatIds = v }
     }
 }
 

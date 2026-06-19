@@ -546,12 +546,25 @@ enum AgentEngine {
         iteration: Int,
         agentMemory: AgentMemory,
         mcpRouter: (any MCPToolRouting)? = nil,
-        documentIndex: DocumentIndex? = nil
+        documentIndex: DocumentIndex? = nil,
+        createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil
     ) async -> ToolResult {
         // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
         // before resolving the tool. Repetition tracking stays on the raw
         // `tc.name` to match the caller's `RepetitionTracker.track(toolCalls:)`.
         let name = canonicalToolName(tc.name)
+
+        // createTask is a meta-tool: it schedules an unattended run via the
+        // TaskScheduler, which this static dispatcher can't reach. The caller
+        // (ChatTurnEngine, which owns AppState) injects a closure; absent it, the
+        // tool is gracefully unavailable. Handled before the repetition / MCP /
+        // built-in dispatch since it isn't a ToolHandler and needs no workdir.
+        if name == "createTask" {
+            let out = createTask != nil
+                ? await createTask!(tc.arguments["goal"] ?? "", tc.arguments["schedule"])
+                : "Error: createTask isn't available in this context."
+            return ToolResult(id: tc.id, name: name, output: out)
+        }
 
         // ── Single repetition guard for ALL tools — built-in and MCP alike ──
         // MCP execution used to live in a separate branch that skipped this

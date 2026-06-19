@@ -68,6 +68,10 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
     /// nil = each run gets its own isolated folder (default). Non-nil = a persistent
     /// shared workspace across runs (Phase 4 toggle).
     var workingDirectory: String?
+    /// Telegram chat id that created this task via the bot's `createTask` tool.
+    /// Non-nil → each finished run is also pushed back to that chat (in addition
+    /// to the desktop notification). nil for tasks created in the app UI.
+    var originTelegramChatId: Int64?
 
     init(id: UUID = UUID(),
          title: String,
@@ -82,7 +86,8 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
          createdAt: Date = Date(),
          lastRunAt: Date? = nil,
          nextFireAt: Date? = nil,
-         workingDirectory: String? = nil) {
+         workingDirectory: String? = nil,
+         originTelegramChatId: Int64? = nil) {
         self.id = id
         self.title = title
         self.goal = goal
@@ -97,11 +102,13 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
         self.lastRunAt = lastRunAt
         self.nextFireAt = nextFireAt
         self.workingDirectory = workingDirectory
+        self.originTelegramChatId = originTelegramChatId
     }
 
     enum CodingKeys: String, CodingKey {
         case id, title, goal, trigger, scheduleText, autonomy, modelPath, useMCP
         case enabled, catchUpMissed, createdAt, lastRunAt, nextFireAt, workingDirectory
+        case originTelegramChatId
     }
 
     init(from decoder: Decoder) throws {
@@ -120,6 +127,7 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
         lastRunAt = try c.decodeIfPresent(Date.self, forKey: .lastRunAt)
         nextFireAt = try c.decodeIfPresent(Date.self, forKey: .nextFireAt)
         workingDirectory = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
+        originTelegramChatId = try c.decodeIfPresent(Int64.self, forKey: .originTelegramChatId)
     }
 }
 

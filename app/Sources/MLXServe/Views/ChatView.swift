@@ -418,10 +418,18 @@ struct ChatSidebar: View {
                 let isSelected = session.id == appState.activeChatId
                 HStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(session.title)
-                            .font(.subheadline.weight(isSelected ? .semibold : .regular))
-                            .lineLimit(1)
-                            .foregroundStyle(isSelected ? .white : .primary)
+                        HStack(spacing: 4) {
+                            if session.isExternalBridge {
+                                Image(systemName: "paperplane.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                                    .help("Telegram conversation (view only)")
+                            }
+                            Text(session.title)
+                                .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                                .lineLimit(1)
+                                .foregroundStyle(isSelected ? .white : .primary)
+                        }
                         Text(relativeTime(session.updatedAt))
                             .font(.caption2)
                             .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.5))
@@ -599,6 +607,22 @@ struct ChatDetailView: View {
 
             // Input area — iMessage style
             VStack(spacing: 4) {
+              if session?.isExternalBridge == true {
+                // Telegram bridge sessions mirror a phone conversation and are
+                // read-only on the Mac: a Telegram bot can only post as itself,
+                // so there's no coherent way to inject a Mac-typed user turn.
+                // Reply from the phone; the mirror updates live here.
+                HStack(spacing: 8) {
+                    Image(systemName: "paperplane.fill")
+                        .foregroundStyle(.secondary)
+                    Text("Telegram conversation — view only. Reply from your phone.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+              } else {
                 // Pending attachment thumbnails (images + PDFs + audio)
                 if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingAudio.isEmpty {
                     AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, audio: $pendingAudio)
@@ -699,6 +723,7 @@ struct ChatDetailView: View {
                     .buttonStyle(.plain)
                     .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty && !chatEngine.isGenerating))
                 }
+              }   // end else (non-Telegram composer)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -1262,6 +1287,10 @@ struct ChatDetailView: View {
     /// agent send path here anymore. Voice turns go straight through the
     /// controller and never touch this method.
     private func sendMessage() {
+        // Telegram bridge sessions are read-only mirrors on the Mac — never inject
+        // a Mac-typed turn (the composer is already replaced by a view-only bar;
+        // this is belt-and-suspenders for any other trigger path).
+        if session?.isExternalBridge == true { return }
         isNearBottom = true // snap to bottom on send
 
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)

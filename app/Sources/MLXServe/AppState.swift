@@ -92,7 +92,12 @@ class AppState: ObservableObject {
     /// Auto-saves on every mutation. Prefer this over the legacy single-key
     /// `maxTokens`/`contextSize` defaults — those forward into here.
     @Published var serverOptions: ServerOptions {
-        didSet { serverOptions.save() }
+        didSet {
+            serverOptions.save()
+            // Reconcile the Telegram bridge whenever options change (cheap no-op
+            // unless the bot token / enabled flag actually moved).
+            telegramBridge.reconcile()
+        }
     }
     /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
     /// Existing call sites (StatusMenuView max-tokens slider, TestServer agent
@@ -116,6 +121,10 @@ class AppState: ObservableObject {
     /// assistant — one code path, no behavioural drift. App-level so generation
     /// is independent of any window.
     lazy var chatEngine = ChatTurnEngine(appState: self)
+
+    /// Telegram bot bridge — message the local model from your phone. Lazily
+    /// created; runs only while `serverOptions.telegram` is enabled with a token.
+    lazy var telegramBridge = TelegramBridge(appState: self)
 
     /// Runs unattended scheduled/on-demand agent tasks (the "claw" spine). Lazily
     /// created so it only spins up the first time the Tasks window is opened.
@@ -170,6 +179,10 @@ class AppState: ObservableObject {
         }
         AgentEngine.cleanupOverflowFiles()
 
+        // Start the Telegram bridge if the user left it enabled (didSet doesn't
+        // fire for the initial serverOptions assignment in init).
+        telegramBridge.reconcile()
+
         // Show welcome window on first launch
         if !hasSeenWelcome {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -215,10 +228,14 @@ class AppState: ObservableObject {
 
     // MARK: - Chat Session Management
 
-    /// Sessions to show in the chat sidebar — excludes transient task-run vehicles.
-    var visibleChatSessions: [ChatSession] {
-        chatSessions.filter { $0.taskRunId == nil }
+    /// Sessions to show in the chat sidebar. Excludes only the transient
+    /// task-run vehicles; Telegram bridge sessions ARE shown — as read-only
+    /// mirrors, flagged with a badge in the sidebar. Pure helper so the filter
+    /// is unit-testable without standing up an AppState.
+    nonisolated static func sidebarSessions(from all: [ChatSession]) -> [ChatSession] {
+        all.filter { $0.taskRunId == nil }
     }
+    var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
     func newChatSession() -> UUID {
         let session = ChatSession()
@@ -305,7 +322,7 @@ class AppState: ObservableObject {
         // Transient task-run sessions live in `chatSessions` only while their run is
         // in flight (the agent loop reads/appends through AppState). They are never
         // persisted here — their transcript is saved out of line by TaskScheduler.
-        let persisted = chatSessions.filter { $0.taskRunId == nil }
+        let persisted = chatSessions.filter { $0.taskRunId == nil && !$0.isExternalBridge }
         guard let data = try? encoder.encode(persisted) else { return }
         try? data.write(to: URL(fileURLWithPath: historyPath))
     }

@@ -94,6 +94,29 @@ final class TaskScheduler: ObservableObject {
         return trimmed.count > 48 ? String(trimmed.prefix(48)) + "…" : (trimmed.isEmpty ? "Untitled task" : trimmed)
     }
 
+    /// What a free-text schedule string means for a programmatically-created task
+    /// (the `createTask` agent tool). Pure/testable so the classification isn't
+    /// buried in an actor-isolated method.
+    enum ScheduleIntent: Equatable {
+        case once                      // run a single time, now (no recurrence)
+        case recurring(TaskTrigger)    // a parsed recurring schedule
+        case invalid                   // provided but unparseable
+    }
+
+    /// Classify the `schedule` argument from the createTask tool. Empty / "now" /
+    /// "once" (and friends) → run once immediately; anything `ScheduleParser`
+    /// understands → recurring; anything else → invalid (so the model gets a
+    /// helpful error instead of a silently-dropped schedule).
+    nonisolated static func scheduleIntent(_ raw: String?) -> ScheduleIntent {
+        let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let onceWords: Set<String> = ["", "now", "once", "immediately", "asap",
+                                      "right now", "right away", "one-off", "one off"]
+        if onceWords.contains(lower) { return .once }
+        if let trigger = ScheduleParser.parse(trimmed) { return .recurring(trigger) }
+        return .invalid
+    }
+
     // MARK: - Scheduling (recurrence)
 
     /// Soonest time `trigger` should fire strictly after `date`. Pure/testable.
@@ -526,6 +549,12 @@ final class TaskScheduler: ObservableObject {
             case .completed: TaskNotifier.shared.notifyCompleted(task: task, run: run)
             case .failed: TaskNotifier.shared.notifyFailed(task: task, run: run)
             default: break
+            }
+            // Bridge-created tasks also report back to the Telegram chat that made
+            // them — in ADDITION to the desktop notification above.
+            if let chatId = task.originTelegramChatId,
+               run.status == .completed || run.status == .failed {
+                appState.telegramBridge.deliverTaskResult(chatId: chatId, task: task, run: run)
             }
         }
     }

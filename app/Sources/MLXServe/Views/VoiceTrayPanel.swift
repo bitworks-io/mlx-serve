@@ -13,6 +13,13 @@ struct VoiceTrayPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             header
 
+            // Non-invasive setup notice: shown when enabling Voice hit a missing
+            // prerequisite. Visible even though `isActive` is false (the toggle
+            // bounces back off), so the user learns why + can jump to Settings.
+            if let issue = voice.setupIssue {
+                setupNotice(issue)
+            }
+
             if voice.isActive {
                 statusLine
                 chips
@@ -62,6 +69,35 @@ struct VoiceTrayPanel: View {
                 }
             }
         )
+    }
+
+    // MARK: Setup notice (missing prerequisite)
+
+    @ViewBuilder
+    private func setupNotice(_ issue: VoicePreflight.Issue) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Text(VoicePreflight.shortMessage(for: issue))
+                    .font(.caption.weight(.semibold))
+            }
+            Text(VoicePreflight.detail(for: issue))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(VoicePreflight.actionLabel(for: issue)) {
+                if let url = URL(string: VoicePreflight.settingsURLString(for: issue)) {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            .controlSize(.small)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     // MARK: Status line

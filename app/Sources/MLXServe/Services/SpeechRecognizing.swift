@@ -14,14 +14,36 @@ protocol SpeechRecognizing: AnyObject {
     var onSpeechStarted: (() -> Void)? { get set }
     var onPartialTranscript: ((String) -> Void)? { get set }
     var onFinalTranscript: ((String) -> Void)? { get set }
+    /// A turn where the mic clearly heard speech (RMS crossed the threshold) but
+    /// recognition produced NOTHING. The signature of on-device dictation being
+    /// off / unavailable while the mic itself works — surfaced to the user as an
+    /// actionable notice after a couple of consecutive occurrences.
+    var onUnrecognizedSpeech: (() -> Void)? { get set }
     var onError: ((String) -> Void)? { get set }
 
     /// Request mic + speech-recognition permission. Safe to call repeatedly.
     func requestAuthorization() async -> Bool
+    /// Granular prerequisite read (prompting for mic/speech if undecided) so the
+    /// UI can show a precise, non-invasive "what's missing" notice before opening
+    /// the mic. A protocol requirement (not just an extension) so the concrete
+    /// recognizer's override is dynamically dispatched; fakes fall back to the
+    /// extension default below.
+    func preflight() async -> VoicePreflight.Snapshot
     /// Open the mic and begin recognizing. Throws if the engine can't start.
     func start() throws
     /// Stop the mic and tear down recognition.
     func stop()
+}
+
+extension SpeechRecognizing {
+    /// Default: derive from the combined `requestAuthorization()` and assume the
+    /// on-device model is present. The real `BaseSpeechRecognizer` overrides this
+    /// with per-prerequisite truth; test fakes inherit this and stay green.
+    func preflight() async -> VoicePreflight.Snapshot {
+        let ok = await requestAuthorization()
+        return VoicePreflight.Snapshot(micAuthorized: ok, speechAuthorized: ok,
+                                       onDeviceAvailable: true, locale: Locale.current.identifier)
+    }
 }
 
 /// Choose the speech-to-text backend.
@@ -57,6 +79,7 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
     var onSpeechStarted: (() -> Void)?
     var onPartialTranscript: ((String) -> Void)?
     var onFinalTranscript: ((String) -> Void)?
+    var onUnrecognizedSpeech: (() -> Void)?
     var onError: ((String) -> Void)?
 
     /// RMS above this counts as speech; tuned for float32 mic input.
@@ -88,6 +111,19 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
             SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
         }
         return mic && speech
+    }
+
+    /// Per-prerequisite read for the pre-flight notice: prompt for mic + speech
+    /// (no-ops once decided), and check whether the on-device model is installed
+    /// for the current locale (voice forces `requiresOnDeviceRecognition`).
+    func preflight() async -> VoicePreflight.Snapshot {
+        let mic = await AudioRecorder.requestPermission()
+        let speech = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
+        }
+        let onDevice = SFSpeechRecognizer(locale: Locale.current)?.supportsOnDeviceRecognition ?? false
+        return VoicePreflight.Snapshot(micAuthorized: mic, speechAuthorized: speech,
+                                       onDeviceAvailable: onDevice, locale: Locale.current.identifier)
     }
 
     func start() throws {
@@ -165,7 +201,14 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
         currentTranscript = ""
         partialTranscript = ""
         resetForNextUtterance()
-        if !text.isEmpty { onFinalTranscript?(text) }
+        if !text.isEmpty {
+            onFinalTranscript?(text)
+        } else {
+            // Heard speech, transcribed nothing → recognition isn't working
+            // (on-device dictation off / unavailable). The controller decides
+            // when to surface a notice (after a couple of these in a row).
+            onUnrecognizedSpeech?()
+        }
     }
 
     static func rms(of buffer: AVAudioPCMBuffer) -> Float {
