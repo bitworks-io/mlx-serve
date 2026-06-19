@@ -211,19 +211,155 @@ final class TelegramTests: XCTestCase {
         XCTAssertEqual(nextOffset, 101, "next offset is max(update_id)+1")
     }
 
-    func testParseUpdatesSkipsNonTextButStillAdvancesOffset() {
-        // A photo (no `text`) must be skipped as a turn, but the offset MUST
-        // advance past it — otherwise getUpdates redelivers it forever.
+    func testParseUpdatesSkipsUnusableButStillAdvancesOffset() {
+        // A sticker (no text, no usable attachment) must be skipped as a turn,
+        // but the offset MUST advance past it — otherwise getUpdates redelivers
+        // it forever.
         let json = """
         {"ok":true,"result":[
           {"update_id":200,"message":{"message_id":5,
             "chat":{"id":42,"type":"private"},"date":1,
-            "photo":[{"file_id":"x"}]}}
+            "sticker":{"file_id":"x","emoji":"😀"}}}
         ]}
         """
         let (updates, nextOffset) = TelegramAPI.parseUpdates(Data(json.utf8))
-        XCTAssertTrue(updates.isEmpty, "non-text update yields no turn")
-        XCTAssertEqual(nextOffset, 201, "offset still advances so the photo isn't redelivered")
+        XCTAssertTrue(updates.isEmpty, "unusable update yields no turn")
+        XCTAssertEqual(nextOffset, 201, "offset still advances so the sticker isn't redelivered")
+    }
+
+    // MARK: - parseUpdates: attachments
+
+    func testParseUpdatesExtractsLargestPhotoWithCaption() throws {
+        // Telegram sends photo sizes ascending; we must pick the largest by area
+        // and surface the caption as the turn's text.
+        let json = """
+        {"ok":true,"result":[
+          {"update_id":300,"message":{"message_id":9,
+            "from":{"id":42,"first_name":"Dave"},
+            "chat":{"id":42,"type":"private"},"date":1,
+            "caption":"what is this?",
+            "photo":[
+              {"file_id":"small","width":90,"height":90},
+              {"file_id":"big","width":1280,"height":960}
+            ]}}
+        ]}
+        """
+        let (updates, nextOffset) = TelegramAPI.parseUpdates(Data(json.utf8))
+        XCTAssertEqual(updates.count, 1)
+        XCTAssertEqual(updates.first?.text, "what is this?", "caption becomes the turn text")
+        XCTAssertEqual(updates.first?.attachment, .photo(fileId: "big"),
+                       "largest photo size must be chosen")
+        XCTAssertEqual(nextOffset, 301)
+    }
+
+    func testParseUpdatesExtractsVoiceWithNoCaption() throws {
+        let json = """
+        {"ok":true,"result":[
+          {"update_id":301,"message":{"message_id":10,
+            "chat":{"id":42,"type":"private"},"date":1,
+            "voice":{"file_id":"voice123","duration":3,"mime_type":"audio/ogg"}}}
+        ]}
+        """
+        let (updates, _) = TelegramAPI.parseUpdates(Data(json.utf8))
+        XCTAssertEqual(updates.count, 1, "a caption-less voice note is still an actionable turn")
+        XCTAssertEqual(updates.first?.text, "", "no caption → empty text")
+        XCTAssertEqual(updates.first?.attachment, .voice(fileId: "voice123"))
+    }
+
+    func testParseUpdatesExtractsImageDocument() throws {
+        let json = """
+        {"ok":true,"result":[
+          {"update_id":302,"message":{"message_id":11,
+            "chat":{"id":42,"type":"private"},"date":1,
+            "document":{"file_id":"doc1","mime_type":"image/png","file_name":"diagram.png"}}}
+        ]}
+        """
+        let (updates, _) = TelegramAPI.parseUpdates(Data(json.utf8))
+        XCTAssertEqual(updates.first?.attachment,
+                       .document(fileId: "doc1", mimeType: "image/png", fileName: "diagram.png"))
+    }
+
+    func testParseFilePathReadsResult() {
+        let ok = #"{"ok":true,"result":{"file_id":"x","file_path":"voice/file_3.oga"}}"#
+        XCTAssertEqual(TelegramAPI.parseFilePath(Data(ok.utf8)), "voice/file_3.oga")
+        XCTAssertNil(TelegramAPI.parseFilePath(Data(#"{"ok":false}"#.utf8)))
+        XCTAssertNil(TelegramAPI.parseFilePath(Data("nope".utf8)))
+    }
+
+    // MARK: - File / chat-action URLs and bodies
+
+    func testGetFileAndDownloadURLs() throws {
+        XCTAssertEqual(TelegramAPI.getFileURL(token: "TOK", fileId: "abc")?.absoluteString,
+                       "https://api.telegram.org/botTOK/getFile?file_id=abc")
+        // The download path uses the /file/ host prefix, NOT /bot<token>/method.
+        XCTAssertEqual(TelegramAPI.fileDownloadURL(token: "TOK", filePath: "voice/file_3.oga")?.absoluteString,
+                       "https://api.telegram.org/file/botTOK/voice/file_3.oga")
+        XCTAssertEqual(TelegramAPI.sendChatActionURL(token: "TOK")?.absoluteString,
+                       "https://api.telegram.org/botTOK/sendChatAction")
+    }
+
+    func testSendChatActionBody() throws {
+        let body = TelegramAPI.sendChatActionBody(chatId: 7123456789, action: "typing")
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual((obj["chat_id"] as? NSNumber)?.int64Value, 7123456789)
+        XCTAssertEqual(obj["action"] as? String, "typing")
+    }
+
+    // MARK: - decideAttachmentAction (capability × attachment matrix)
+
+    private func update(_ attachment: TelegramUpdate.Attachment?) -> TelegramUpdate {
+        TelegramUpdate(updateId: 1, chatId: 1, text: "", senderName: "u", attachment: attachment)
+    }
+
+    func testDecidePlainTextIsTextOnly() {
+        let action = TelegramAPI.decideAttachmentAction(update(nil),
+                                                        supportsVision: false, supportsAudio: false)
+        XCTAssertEqual(action, .textOnly)
+    }
+
+    func testDecidePhotoGatesOnVision() {
+        XCTAssertEqual(
+            TelegramAPI.decideAttachmentAction(update(.photo(fileId: "p")),
+                                               supportsVision: true, supportsAudio: false),
+            .image(fileId: "p"))
+        XCTAssertEqual(
+            TelegramAPI.decideAttachmentAction(update(.photo(fileId: "p")),
+                                               supportsVision: false, supportsAudio: false),
+            .imageUnsupported)
+    }
+
+    func testDecideVoiceFeedsAudioModelButTranscribesOtherwise() {
+        // Audio-capable model hears the clip…
+        XCTAssertEqual(
+            TelegramAPI.decideAttachmentAction(update(.voice(fileId: "v")),
+                                               supportsVision: false, supportsAudio: true),
+            .audio(fileId: "v", transcribe: false))
+        // …a non-audio model gets the on-device transcript instead.
+        XCTAssertEqual(
+            TelegramAPI.decideAttachmentAction(update(.voice(fileId: "v")),
+                                               supportsVision: true, supportsAudio: false),
+            .audio(fileId: "v", transcribe: true))
+    }
+
+    func testDecideDocumentRoutesByMime() {
+        XCTAssertEqual(
+            TelegramAPI.decideAttachmentAction(
+                update(.document(fileId: "d", mimeType: "image/png", fileName: "a.png")),
+                supportsVision: true, supportsAudio: false),
+            .image(fileId: "d"))
+        XCTAssertEqual(
+            TelegramAPI.decideAttachmentAction(
+                update(.document(fileId: "d", mimeType: "audio/mpeg", fileName: "a.mp3")),
+                supportsVision: false, supportsAudio: true),
+            .audio(fileId: "d", transcribe: false))
+        // A non-media document is politely refused.
+        let pdf = TelegramAPI.decideAttachmentAction(
+            update(.document(fileId: "d", mimeType: "application/pdf", fileName: "report.pdf")),
+            supportsVision: true, supportsAudio: true)
+        guard case .unsupported(let reason) = pdf else {
+            return XCTFail("a PDF document must be .unsupported, got \(pdf)")
+        }
+        XCTAssertTrue(reason.contains("report.pdf"), reason)
     }
 
     func testParseUpdatesEmptyResultKeepsOffset() {

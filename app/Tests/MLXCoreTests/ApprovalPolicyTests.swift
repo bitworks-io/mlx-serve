@@ -104,6 +104,29 @@ final class ApprovalPolicyTests: XCTestCase {
         XCTAssertFalse(ApprovalPolicy.isMCPTool("shell"))
     }
 
+    // MARK: createTask — benign meta-tool, allowed on the unattended path
+
+    func testFullAutoAllowsCreateTask() {
+        // createTask only SCHEDULES a background run (that run is governed by its
+        // own autonomy). Over Telegram there's no human to approve, and the tool
+        // is built to report back to the chat — so fullAuto must auto-allow it,
+        // otherwise the agent's createTask shows up as "denied by user".
+        XCTAssertEqual(decide("createTask", .fullAuto,
+                              args: ["goal": "Summarize the news", "schedule": "every day at 8am"]),
+                       .allow)
+    }
+
+    func testCreateTaskBehaviorAtOtherLevels() {
+        // yolo allows everything…
+        XCTAssertEqual(decide("createTask", .yolo, args: ["goal": "x"], wd: nil), .allow)
+        // …and the attended levels still confirm it since it changes state.
+        for level in [TaskAutonomy.readOnly, .workspace] {
+            guard case .ask = decide("createTask", level, args: ["goal": "x"]) else {
+                return XCTFail("\(level) should pause createTask")
+            }
+        }
+    }
+
     // MARK: isConfined helper
 
     func testIsConfined() {

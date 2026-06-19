@@ -538,6 +538,22 @@ struct ChatDetailView: View {
         appState.chatSessions.first { $0.id == sessionId }
     }
 
+    /// True when the visible session mirrors a Telegram conversation. The
+    /// think/agent/MCP toolbar toggles then read & write the shared
+    /// `serverOptions.telegram` config (kept in sync with Settings, read live by
+    /// the bridge) instead of the in-app per-session / app-level state.
+    private var isExternalBridgeSession: Bool { session?.isExternalBridge == true }
+
+    /// Resolved on/off state for the three mode toggles in the toolbar — sourced
+    /// from `serverOptions.telegram` for a Telegram session, else the in-app state.
+    private var toolbarToggles: ChatModeToggles {
+        let tg = appState.serverOptions.telegram
+        return ChatModeToggles.resolve(
+            isExternalBridge: isExternalBridgeSession,
+            telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
+            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: appState.mcpMode)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Messages
@@ -806,7 +822,11 @@ struct ChatDetailView: View {
             }
             ToolbarItem(placement: .automatic) {
                 Button {
-                    if !enableThinking && isAgentMode {
+                    if isExternalBridgeSession {
+                        // Telegram session: write the shared config so the toggle
+                        // stays in sync with Settings and the bridge reads it live.
+                        appState.serverOptions.telegram.enableThinking.toggle()
+                    } else if !enableThinking && isAgentMode {
                         showThinkingInAgentConfirm = true
                     } else {
                         enableThinking.toggle()
@@ -818,26 +838,32 @@ struct ChatDetailView: View {
                         Text("Think")
                             .font(.caption.weight(.medium))
                     }
-                    .foregroundStyle(enableThinking ? .white : .secondary)
+                    .foregroundStyle(toolbarToggles.thinking ? .white : .secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(enableThinking ? .blue : Color.secondary.opacity(0.12))
+                    .background(toolbarToggles.thinking ? .blue : Color.secondary.opacity(0.12))
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .help("Thinking Mode (\(enableThinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
+                .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
                 .padding(.leading, 8)
                 .padding(.trailing, 4)
             }
             ToolbarItem(placement: .automatic) {
                 Button {
-                    isAgentMode.toggle()
-                    // Re-arm the approval gate every time the user re-enters
-                    // Agent mode. "Always allow this session" decays here.
-                    if !isAgentMode { sessionAllowAll = false }
-                    // Thinking + tool-calling loops degrade quality on most
-                    // local models — auto-off when entering Agent mode.
-                    if isAgentMode { enableThinking = false }
+                    if isExternalBridgeSession {
+                        // Telegram session: flip the shared config (in sync with
+                        // Settings); no per-session approval state applies here.
+                        appState.serverOptions.telegram.agentMode.toggle()
+                    } else {
+                        isAgentMode.toggle()
+                        // Re-arm the approval gate every time the user re-enters
+                        // Agent mode. "Always allow this session" decays here.
+                        if !isAgentMode { sessionAllowAll = false }
+                        // Thinking + tool-calling loops degrade quality on most
+                        // local models — auto-off when entering Agent mode.
+                        if isAgentMode { enableThinking = false }
+                    }
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "wrench")
@@ -845,15 +871,15 @@ struct ChatDetailView: View {
                         Text("Agent")
                             .font(.caption.weight(.medium))
                     }
-                    .foregroundStyle(isAgentMode ? .white : .secondary)
+                    .foregroundStyle(toolbarToggles.agent ? .white : .secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(isAgentMode ? .orange : Color.secondary.opacity(0.12))
+                    .background(toolbarToggles.agent ? .orange : Color.secondary.opacity(0.12))
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .help("""
-                Agent Mode (\(isAgentMode ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
+                Agent Mode (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
                   • shell — run a shell command in the workspace
                   • cwd — change the workspace working directory
                   • readFile — read a file (with line range)
@@ -869,14 +895,21 @@ struct ChatDetailView: View {
             }
             ToolbarItem(placement: .automatic) {
                 HStack(spacing: 0) {
-                    Button { appState.mcpMode.toggle() } label: {
+                    Button {
+                        if isExternalBridgeSession {
+                            // Telegram session: flip the shared config (synced with Settings).
+                            appState.serverOptions.telegram.useMCP.toggle()
+                        } else {
+                            appState.mcpMode.toggle()
+                        }
+                    } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "puzzlepiece.extension")
                                 .font(.system(size: 11, weight: .medium))
                             Text("MCP")
                                 .font(.caption.weight(.medium))
                         }
-                        .foregroundStyle(appState.mcpMode ? .white : .secondary)
+                        .foregroundStyle(toolbarToggles.mcp ? .white : .secondary)
                         .padding(.leading, 8)
                         .padding(.vertical, 4)
                     }
@@ -884,7 +917,7 @@ struct ChatDetailView: View {
                     Button { showMCPMarketplace = true } label: {
                         Image(systemName: "gearshape.fill")
                             .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(appState.mcpMode ? .white.opacity(0.85) : .secondary)
+                            .foregroundStyle(toolbarToggles.mcp ? .white.opacity(0.85) : .secondary)
                             .padding(.trailing, 8)
                             .padding(.leading, 4)
                             .padding(.vertical, 4)
@@ -892,9 +925,9 @@ struct ChatDetailView: View {
                     .buttonStyle(.plain)
                     .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
                 }
-                .background(appState.mcpMode ? .purple : Color.secondary.opacity(0.12))
+                .background(toolbarToggles.mcp ? .purple : Color.secondary.opacity(0.12))
                 .clipShape(Capsule())
-                .help("MCP Mode (\(appState.mcpMode ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
+                .help("MCP Mode (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
             }
             ToolbarItem(placement: .automatic) {
                 Circle()
@@ -1688,6 +1721,25 @@ enum ChatRow: Identifiable {
 }
 
 /// Folds the agent's separate "tool call" and "tool result" summary messages
+/// Which on/off state the chat toolbar's Think / Agent / MCP toggles show.
+/// Telegram bridge sessions mirror the shared `serverOptions.telegram` config —
+/// so the toolbar stays in lockstep with Settings (one source of truth, read
+/// live by the bridge); normal sessions use the per-session / app-level state.
+/// Pure → unit-tested in ChatModeTogglesTests.
+struct ChatModeToggles: Equatable {
+    var thinking: Bool
+    var agent: Bool
+    var mcp: Bool
+
+    static func resolve(isExternalBridge: Bool,
+                        telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
+                        inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool) -> ChatModeToggles {
+        isExternalBridge
+            ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
+            : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
+    }
+}
+
 /// (both `isAgentSummary`) into one row: a `name(args)` header with the result(s)
 /// behind an expander. Pure → unit-tested in ChatRowBuilderTests.
 enum ChatRowBuilder {

@@ -105,6 +105,31 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertFalse(APIClient.parseModelInfo(textOnly).supportsAudio)
     }
 
+    func testParseModelInfoReadsVisionCapability() {
+        // A vision model advertises "vision" + "image"; the Telegram bridge
+        // reads this to decide whether to forward an incoming photo.
+        let visionModel: [String: Any] = [
+            "id": "gemma-4-e4b-it-4bit",
+            "capabilities": ["chat", "vision", "streaming"],
+            "input_modalities": ["text", "image"],
+            "meta": ["architecture": "gemma4"],
+        ]
+        XCTAssertTrue(APIClient.parseModelInfo(visionModel).supportsVision)
+
+        // `--no-vision` (or a text-only model): the encoder isn't loaded, so the
+        // server omits "vision"/"image" and the bridge must refuse photos.
+        let textOnly: [String: Any] = [
+            "id": "qwen3",
+            "capabilities": ["chat", "streaming"],
+            "input_modalities": ["text"],
+            "meta": ["architecture": "qwen3_5"],
+        ]
+        XCTAssertFalse(APIClient.parseModelInfo(textOnly).supportsVision)
+
+        // Pre-capability server (no arrays) defaults to no vision.
+        XCTAssertFalse(APIClient.parseModelInfo(["id": "x", "meta": [:]]).supportsVision)
+    }
+
     func testParseModelInfoFromUnloadedEntry() {
         // Phase E stub form: state present, bytes_resident=0, bytes_on_disk
         // either top-level or under meta (we accept both).

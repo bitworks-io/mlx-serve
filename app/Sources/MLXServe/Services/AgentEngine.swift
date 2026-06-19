@@ -697,6 +697,15 @@ enum AgentEngine {
         return "\(preview)\n\n[... truncated at \(maxChars) of \(output.count) chars]"
     }
 
+    /// The visible tool-result summary shown in the chat transcript. Built from
+    /// the **already-computed model-facing content** (the exact string put on the
+    /// tool message the model receives), so the UI shows the result 1:1 with what
+    /// the model saw — no separate, smaller display cap. The leading `**name** → `
+    /// is the discriminator `ChatRowBuilder` uses to fold the row.
+    static func toolResultSummary(name: String, modelContent: String) -> String {
+        "**\(name)** → \(modelContent)"
+    }
+
     /// Clean up overflow files older than 24 hours.
     static func cleanupOverflowFiles() {
         let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath

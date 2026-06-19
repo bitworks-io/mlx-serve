@@ -194,6 +194,11 @@ struct ModelInfo {
     /// unified). Gates the mic button + audio-file attachment in chat — other
     /// models silently ignore audio, so we only surface it where it works.
     var supportsAudio: Bool = false
+    /// True when the model advertises the `vision` capability (a SigLIP-style
+    /// encoder is loaded) — `false` for text-only models AND when the server
+    /// was launched with `--no-vision`. The Telegram bridge reads this to
+    /// decide whether to forward an incoming photo or refuse it.
+    var supportsVision: Bool = false
     /// True when the model advertises the `embeddings` capability (encoder-
     /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
     /// GPU embedder for folder indexing.

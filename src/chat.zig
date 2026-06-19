@@ -853,9 +853,11 @@ fn fallbackFormatChat(
 /// channel-thought tail behavior) — and sometimes SEVERAL in a row, none of
 /// them closed (seen live from the 26B GGUF via pi). Everything from the
 /// first such opener onward is dangling thought; cutting at the LAST opener
-/// instead leaks the earlier raw tags into visible content. Position-0
-/// openers are excluded — leading openers are handled by the dedicated
-/// leading-block branches.
+/// instead leaks the earlier raw tags into visible content. A pos-0 opener is
+/// reported too: callers (stripThinkBlock / stripTrailingThinkOpen) strip
+/// their leading CLOSED block first, so an unclosed opener at the start of the
+/// remainder is a genuine dangling re-open (`…<channel|>\n<|channel>thought\n`,
+/// 2026-06-19 live) — excluding it leaked the bare opener into content.
 const TrailingThinkOpen = struct { pos: usize, after: usize };
 fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
     var from: usize = 0;
@@ -866,7 +868,6 @@ fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
             from = close_pos + close_tag.len;
             continue;
         }
-        if (o.pos == 0) return null;
         return .{ .pos = o.pos, .after = o.after };
     }
     return null;
@@ -931,10 +932,13 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
         var content = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
-        // Strip the content channel tag: <|channel>\n or <|channel>
+        // Strip the content channel tag: <|channel>\n or <|channel>. A
+        // re-opened THOUGHT channel (`<|channel>thought…`) is NOT a content
+        // opener — stripping its `<|channel>` prefix here left a bare "thought"
+        // in visible content (2026-06-19 live); leave it for stripTrailingThinkOpen.
         if (std.mem.startsWith(u8, content, "<|channel>\n")) {
             content = content[11..];
-        } else if (std.mem.startsWith(u8, content, "<|channel>")) {
+        } else if (std.mem.startsWith(u8, content, "<|channel>") and !std.mem.startsWith(u8, content, "<|channel>thought")) {
             content = content[10..];
         }
         content = std.mem.trimStart(u8, content, "\n ");
@@ -3453,6 +3457,38 @@ test "stripThinkBlock trailing unclosed thought opener does not leak" {
     try testing.expectEqualStrings("Here is the design.", stripThinkBlock("Here is the design.\n<|channel>thought"));
     try testing.expectEqualStrings("Here is the design.", stripThinkBlock("Here is the design.\n<|channel>thought\nI should now write"));
     try testing.expectEqualStrings("Done.", stripThinkBlock("Done.\n<think>hmm"));
+}
+
+test "splitThinkBlock re-opened thought opener right after close does not leak" {
+    // 2026-06-19 live regression (gemma-4): the model closed its thought
+    // channel and IMMEDIATELY re-opened a fresh one with nothing between, then
+    // the turn ended. The leading-strip consumed the first closed block,
+    // leaving the bare re-opened opener at pos 0 of the remainder — it must
+    // still vanish, and `<|channel>thought` must never be mis-stripped as a
+    // CONTENT channel (`<|channel>`), which leaked a glued "thought".
+    {
+        const r = splitThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false);
+        try testing.expectEqualStrings("", r.content);
+        try testing.expectEqualStrings("Let me plan.", r.reasoning_content.?);
+    }
+    {
+        // <think> family equivalent.
+        const r = splitThinkBlock("<think>plan</think>\n<think>", true, false);
+        try testing.expectEqualStrings("", r.content);
+    }
+    {
+        // Content BETWEEN the close and the re-open must survive the cut.
+        const r = splitThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false);
+        try testing.expectEqualStrings("Ready.", r.content);
+    }
+}
+
+test "stripThinkBlock re-opened thought opener right after close does not leak" {
+    // Thinking-off path of the same regression — this is the exact form that
+    // reached chat-history.json (`<|channel>thought\n` as the whole content).
+    try testing.expectEqualStrings("", stripThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n"));
+    try testing.expectEqualStrings("Ready.", stripThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n"));
+    try testing.expectEqualStrings("", stripThinkBlock("<think>plan</think>\n<think>"));
 }
 
 test "parseToolCalls Gemma 4 format" {

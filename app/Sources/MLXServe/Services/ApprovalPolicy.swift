@@ -58,7 +58,11 @@ enum ApprovalPolicy {
             return .ask(reason: "“\(tool)” can act outside the task's folder, so it needs your OK.")
 
         case .fullAuto:
-            if readOnlyTools.contains(tool) || tool == "shell" || tool == "saveMemory" || isMCPTool(tool) {
+            // `createTask` only schedules a background run (itself governed by its
+            // own autonomy when it executes) — benign like `saveMemory`, and the
+            // whole point of unattended/Telegram agents, so it auto-allows here.
+            if readOnlyTools.contains(tool) || tool == "shell" || tool == "saveMemory"
+                || tool == "createTask" || isMCPTool(tool) {
                 return .allow
             }
             if pathWriteTools.contains(tool) {

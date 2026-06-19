@@ -1078,8 +1078,68 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     return computeMaxSafeContext(config);
 }
 
-/// Compute the maximum safe context length based on available GPU memory.
-/// Solves: (heads × seq² × 4 + layers × 2 × seq × kv_heads × head_dim × 2) × 1.25 ≤ available
+/// Metal's recommended max working-set size for the default device — the real
+/// ceiling whose breach throws `[METAL] … Insufficient Memory` from the
+/// command-buffer completion handler (which terminates the process: ggml's
+/// global std::terminate handler prints the backtrace, but the throw is MLX's).
+/// `getMetalBufferLimit()` (75% of physical RAM) over-estimates this on
+/// small-RAM Macs — a 16 GB Mac reports ~11.9 GB recommended vs the 12 GB that
+/// hw.memsize×0.75 yields — so budgeting against hw.memsize lets auto-context
+/// oversubscribe. Falls back to `getMetalBufferLimit()` when the device query
+/// is unavailable (CI / non-Metal hosts).
+fn getGpuWorkingSetLimit() u64 {
+    var dev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&dev);
+    var info = mlx.mlx_device_info_new();
+    defer _ = mlx.mlx_device_info_free(info);
+    if (mlx.mlx_device_info_get(&info, dev) == 0) {
+        var max_rec: usize = 0;
+        if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
+            return @as(u64, max_rec);
+        }
+    }
+    return getMetalBufferLimit();
+}
+
+/// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
+/// length whose KV cache + per-token working set fits under the GPU
+/// working-set ceiling, after subtracting what's already resident
+/// (`active_mem` — model weights + any resident hot-cache KV) AND the hot
+/// prefix cache's FULL byte budget (`hot_cache_reserve`).
+///
+/// Reserving the whole cache budget — not just its current residency — budgets
+/// for STEADY STATE. Over an agentic session the hot cache fills to its cap, so
+/// an auto-context computed against an empty cache (24k tokens on a 16 GB Mac,
+/// 2026-06-19 live qwen3_5_moe) later collides with the filled 2 GB cache plus a
+/// large cold MoE prefill and the command buffer OOMs. Subtracting it up front
+/// keeps the reported context stable across the session and within the ceiling
+/// once the cache is full. The 0.64 factor (two ×4/5 margins) absorbs the
+/// prefill compute spike that lands on top of `active_mem`.
+fn safeContextForBudget(
+    working_set_limit: u64,
+    active_mem: u64,
+    hot_cache_reserve: u64,
+    per_tok: u64,
+    max_pos: u32,
+) u32 {
+    if (per_tok == 0) return 1024;
+    const spoken_for: u64 = active_mem + hot_cache_reserve;
+    const usable: u64 = if (working_set_limit > spoken_for) working_set_limit - spoken_for else 0;
+    const budget: u64 = usable * 4 / 5;
+    const max_seq: u64 = (budget * 4 / 5) / per_tok;
+    if (max_seq == 0) return 1024;
+
+    var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
+    // Cap at model's max position embeddings.
+    if (max_pos > 0) result = @min(result, max_pos);
+    return result;
+}
+
+/// Compute the maximum safe context length based on the GPU working-set
+/// ceiling, the model's per-token footprint, and the hot prefix cache budget.
+/// Linear in seq (per_tok × seq ≤ budget) — no seq² term, MLX's fused SDPA
+/// tiles over seq and never materializes [heads, seq, seq]. See
+/// `safeContextForBudget` for the steady-state reservation rationale.
 fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
@@ -1090,32 +1150,25 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
-    const total_limit = getMetalBufferLimit();
-    var active_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-    const available: u64 = if (total_limit > active_mem) total_limit - active_mem else 0;
-
-    // Linear in seq: per_tok × seq ≤ budget. Mirrors checkAttentionMemory's model.
-    // No seq² term — MLX's fused SDPA tiles over seq and never materializes [heads, seq, seq].
     //   KV cache (fp16):   layers × 2 × kv_heads × head_dim × 2 bytes per token
     //   Working (fp16):    ~8 × max(hidden, ffn) × 2 bytes per token (per-layer tensors,
     //                      bounded by EVAL_EVERY_N_LAYERS in transformer.zig)
     const kv_per_tok: u64 = layers * 2 * kv_heads * hdim * 2;
     const work_per_tok: u64 = 8 * @max(hidden, ffn) * 2;
     const per_tok: u64 = kv_per_tok + work_per_tok;
-    if (per_tok == 0) return 1024;
 
-    // 80% of available, then divide by 1.25 margin (matches checkAttentionMemory's 5/4)
-    const budget: u64 = available * 4 / 5;
-    const max_seq: u64 = (budget * 4 / 5) / per_tok;
-    if (max_seq == 0) return 1024;
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
 
-    var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
-    // Cap at model's max position embeddings
-    if (config.max_position_embeddings > 0) {
-        result = @min(result, config.max_position_embeddings);
-    }
-    return result;
+    return safeContextForBudget(
+        getGpuWorkingSetLimit(),
+        active_mem,
+        // The hot prefix cache fills to this cap over a session — reserve it so
+        // auto-context doesn't oversubscribe once the cache is full.
+        prefix_cache_mem_bytes,
+        per_tok,
+        config.max_position_embeddings,
+    );
 }
 
 /// Estimate peak GPU memory for prefill and reject if it would exceed Metal buffer limit.
@@ -1148,8 +1201,11 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // Total estimate with 25% safety margin
     const needed: u64 = (kv_bytes + working_bytes) * 5 / 4;
 
-    // Available = Metal limit minus current GPU usage (model weights etc.)
-    const total_limit: u64 = getMetalBufferLimit();
+    // Available = GPU working-set ceiling minus current usage (model weights,
+    // resident hot-cache KV, etc.). Uses the same real Metal limit as the
+    // auto-context budget (getGpuWorkingSetLimit) so the two prefill guards
+    // agree — not hw.memsize×0.75, which over-estimates on small-RAM Macs.
+    const total_limit: u64 = getGpuWorkingSetLimit();
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
@@ -9150,6 +9206,42 @@ test "getEffectiveContextLength computes safe default from GPU memory" {
     // Explicit --ctx-size overrides the computed default
     server_config.max_context_size = 32768;
     try testing.expectEqual(@as(u32, 32768), getEffectiveContextLength(&config));
+}
+
+test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regression)" {
+    const GB: u64 = 1 << 30;
+    // qwen3_5_moe footprint that OOM'd a 16 GB Mac: 32 layers, 4 kv heads, head_dim 256.
+    const kv_per_tok: u64 = 32 * 2 * 4 * 256 * 2; // 131072
+    const work_per_tok: u64 = 8 * 9216 * 2; //        147456
+    const per_tok: u64 = kv_per_tok + work_per_tok;
+
+    // Mid-session: ~6 GB resident (model + a partly-filled hot cache), 2 GB cache cap.
+    const ws: u64 = 12 * GB; // ~Metal recommended working set on a 16 GB Mac
+    const active: u64 = 6 * GB;
+    const cache: u64 = 2 * GB;
+
+    const with_reserve = safeContextForBudget(ws, active, cache, per_tok, 0);
+    const without_reserve = safeContextForBudget(ws, active, 0, per_tok, 0);
+
+    // The whole point of the fix: subtracting the hot-cache budget shrinks the
+    // reported context so it still fits once the cache fills (it didn't before
+    // — auto-ctx was computed against an empty cache and later collided with it).
+    try testing.expect(with_reserve < without_reserve);
+    // Still usable, never floored to nothing.
+    try testing.expect(with_reserve > 1024);
+}
+
+test "safeContextForBudget floors when memory is exhausted and caps at max_pos" {
+    const GB: u64 = 1 << 30;
+    const per_tok: u64 = 278528;
+    // working set already below what's resident → no room → minimum floor.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(4 * GB, 5 * GB, 0, per_tok, 0));
+    // active + reserve exceeds the ceiling → floor.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(8 * GB, 6 * GB, 4 * GB, per_tok, 0));
+    // Plenty of memory, but capped at the model's max position embeddings.
+    try testing.expectEqual(@as(u32, 4096), safeContextForBudget(256 * GB, 0, 0, per_tok, 4096));
+    // Degenerate per_tok never divides by zero.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(8 * GB, 0, 0, 0, 0));
 }
 
 test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {

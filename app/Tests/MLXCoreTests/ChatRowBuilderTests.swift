@@ -93,4 +93,31 @@ final class ChatRowBuilderTests: XCTestCase {
         // Non-agent-summary content is neither.
         XCTAssertFalse(ChatRowBuilder.isCallSummary(normal("**a** → b")))
     }
+
+    // MARK: - Tool-result summary mirrors the model 1:1
+
+    /// The visible tool-result row must carry the ENTIRE model-facing content,
+    /// not a short preview — regression guard for the old 500-char display cap
+    /// that made large MCP results (e.g. dbhub__search_objects) look truncated
+    /// in the UI even though the model received much more.
+    func testToolResultSummaryShowsFullModelContent() {
+        // A model-facing result well past the old 500-char display cap.
+        let modelContent = String(repeating: "row\n", count: 400) + "FINAL_ROW"
+        XCTAssertGreaterThan(modelContent.count, 1000)
+
+        let summary = AgentEngine.toolResultSummary(name: "dbhub__search_objects",
+                                                    modelContent: modelContent)
+
+        XCTAssertTrue(summary.hasPrefix("**dbhub__search_objects** → "),
+                      "must keep the `**name** → ` discriminator so the row folds")
+        XCTAssertTrue(summary.contains("FINAL_ROW"),
+                      "content past the old 500-char cap must be present (1:1 with the model)")
+        XCTAssertTrue(summary.contains(modelContent),
+                      "the visible summary must contain the model content verbatim")
+
+        // And it still classifies as a result summary for ChatRowBuilder folding.
+        var m = ChatMessage(role: .assistant, content: summary)
+        m.isAgentSummary = true
+        XCTAssertTrue(ChatRowBuilder.isResultSummary(m))
+    }
 }

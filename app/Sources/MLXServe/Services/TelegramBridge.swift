@@ -204,12 +204,15 @@ final class TelegramBridge: ObservableObject {
 
     private func handle(_ update: TelegramUpdate, token: String) async {
         let text = update.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
         let chatId = update.chatId
+        // Either text or a media attachment is needed to act (parse already
+        // dropped empty/unsupported messages, but be defensive).
+        guard !text.isEmpty || update.attachment != nil else { return }
 
         // Access gate — read live so allow-list edits in Settings take effect at
         // once. This is the bot's only protection against a stranger driving the
-        // local model, so it runs before anything else.
+        // local model, so it runs before anything else. Applies to attachment-
+        // only messages too (a photo is enough to adopt a first chat).
         switch appState.serverOptions.telegram.access(forChatId: chatId) {
         case .rejected:
             await send(token: token, chatId: chatId, text: "⛔️ This bot is locked to another chat.")
@@ -226,17 +229,19 @@ final class TelegramBridge: ObservableObject {
             break
         }
 
-        // Commands.
-        switch text {
-        case "/start":
-            await send(token: token, chatId: chatId, text: startHelp())
-            return
-        case "/new", "/reset":
-            sessions[chatId] = nil
-            await send(token: token, chatId: chatId, text: "🧹 Started a new conversation.")
-            return
-        default:
-            break
+        // Commands — only a plain text message (no attachment) is a command.
+        if update.attachment == nil {
+            switch text {
+            case "/start":
+                await send(token: token, chatId: chatId, text: startHelp())
+                return
+            case "/new", "/reset":
+                sessions[chatId] = nil
+                await send(token: token, chatId: chatId, text: "🧹 Started a new conversation.")
+                return
+            default:
+                break
+            }
         }
 
         guard appState.server.status == .running else {
@@ -245,15 +250,97 @@ final class TelegramBridge: ObservableObject {
             return
         }
 
-        let reply = await generateReply(chatId: chatId, senderName: update.senderName, text: text)
+        // Route on the attachment kind and the LOADED model's live capabilities
+        // (`supportsVision`/`supportsAudio` drop out under `--no-vision` / on a
+        // text-only model, which is exactly what gates the refusal messages).
+        let info = appState.server.modelInfo
+        let action = TelegramAPI.decideAttachmentAction(update,
+            supportsVision: info?.supportsVision ?? false,
+            supportsAudio: info?.supportsAudio ?? false)
+
+        switch action {
+        case .imageUnsupported:
+            await send(token: token, chatId: chatId,
+                       text: "🚫 This model can't see images. Load a vision model (e.g. Gemma 4) in MLX Core and try again.")
+        case .unsupported(let reason):
+            await send(token: token, chatId: chatId, text: reason)
+        case .textOnly, .image, .audio:
+            // Everything that generates a reply runs under the "typing…"
+            // indicator for the whole download → decode → generate span.
+            await withTyping(token: token, chatId: chatId) {
+                await self.handleGenerating(action: action, update: update, token: token, text: text)
+            }
+        }
+    }
+
+    /// Download / decode / transcribe an attachment as needed, run the turn, and
+    /// send the reply. Called only for the generating actions, inside `withTyping`.
+    private func handleGenerating(action: TelegramAttachmentAction, update: TelegramUpdate,
+                                  token: String, text: String) async {
+        let chatId = update.chatId
+        switch action {
+        case .textOnly:
+            let reply = await generateReply(chatId: chatId, senderName: update.senderName, text: text)
+            await sendReply(token: token, chatId: chatId, reply: reply)
+
+        case .image(let fileId):
+            guard let bytes = await download(token: token, fileId: fileId) else {
+                await send(token: token, chatId: chatId, text: "⚠️ I couldn't download that image. Try sending it again.")
+                return
+            }
+            let reply = await generateReply(chatId: chatId, senderName: update.senderName,
+                                            text: text, images: [ChatImage(data: bytes)])
+            await sendReply(token: token, chatId: chatId, reply: reply)
+
+        case .audio(let fileId, let transcribe):
+            guard let bytes = await download(token: token, fileId: fileId) else {
+                await send(token: token, chatId: chatId, text: "⚠️ I couldn't download that voice clip. Try sending it again.")
+                return
+            }
+            guard let decoded = VoicePreprocessor.decode(
+                bytes,
+                oggOpus: Self.attachmentIsOggOpus(update.attachment),
+                sourceExtension: Self.attachmentAudioExtension(update.attachment)
+            ) else {
+                await send(token: token, chatId: chatId, text: "⚠️ I couldn't decode that voice clip.")
+                return
+            }
+            defer { try? FileManager.default.removeItem(at: decoded.fileURL) }
+
+            if transcribe {
+                // Model can't hear — transcribe on-device and send the words.
+                switch await VoiceTranscriber.transcribe(fileURL: decoded.fileURL) {
+                case .success(let transcript):
+                    let combined = text.isEmpty ? "[voice] \(transcript)" : "\(text)\n\n[voice] \(transcript)"
+                    let reply = await generateReply(chatId: chatId, senderName: update.senderName, text: combined)
+                    await sendReply(token: token, chatId: chatId, reply: reply)
+                case .failure(let failure):
+                    await send(token: token, chatId: chatId, text: Self.transcriptionMessage(for: failure))
+                }
+            } else {
+                // Model is audio-capable — feed the decoded PCM so it "hears" it.
+                let clip = ChatAudio(name: "voice.m4a", pcm: decoded.pcm)
+                let reply = await generateReply(chatId: chatId, senderName: update.senderName,
+                                                text: text, audio: [clip])
+                await sendReply(token: token, chatId: chatId, reply: reply)
+            }
+
+        case .imageUnsupported, .unsupported:
+            break   // handled by the caller before reaching here
+        }
+    }
+
+    private func sendReply(token: String, chatId: Int64, reply: String) async {
         for chunk in TelegramAPI.splitForTelegram(reply) {
             await send(token: token, chatId: chatId, text: chunk)
         }
     }
 
     /// Run one turn through the canonical engine against the chat's hidden
-    /// session and return the final assistant text.
-    private func generateReply(chatId: Int64, senderName: String, text: String) async -> String {
+    /// session and return the final assistant text. `images`/`audio` are the
+    /// decoded attachments (when the loaded model can consume them).
+    private func generateReply(chatId: Int64, senderName: String, text: String,
+                               images: [ChatImage]? = nil, audio: [ChatAudio]? = nil) async -> String {
         let cfg = appState.serverOptions.telegram
         let sessionId = sessionId(for: chatId, senderName: senderName, agentMode: cfg.agentMode)
         let workspace = Self.agentWorkspace
@@ -269,8 +356,8 @@ final class TelegramBridge: ObservableObject {
         engine.runTurn(
             sessionId: sessionId,
             userText: text,
-            images: nil,
-            audio: nil,
+            images: images,
+            audio: audio,
             config: turnConfig,
             approval: { tc in
                 // Agent-over-Telegram has no interactive approval surface, so
@@ -377,6 +464,81 @@ final class TelegramBridge: ObservableObject {
         return TelegramAPI.parseUsername(data)
     }
 
+    /// POST a single `sendChatAction` (typing). Best-effort — failures are
+    /// invisible to the user (the indicator just doesn't show), so we ignore them.
+    private func sendChatAction(token: String, chatId: Int64) async {
+        guard let url = TelegramAPI.sendChatActionURL(token: token) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = TelegramAPI.sendChatActionBody(chatId: chatId)
+        _ = try? await session.data(for: req)
+    }
+
+    /// Show Telegram's "typing…" indicator for the whole duration of `body`.
+    /// The action expires after ~5 s, so a side task re-posts it every 4 s and
+    /// is cancelled the instant `body` returns.
+    private func withTyping<T>(token: String, chatId: Int64, _ body: () async -> T) async -> T {
+        let typing = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.sendChatAction(token: token, chatId: chatId)
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
+        }
+        defer { typing.cancel() }
+        return await body()
+    }
+
+    /// Resolve a `file_id` via `getFile` and download its bytes. Caps at
+    /// Telegram's 20 MB bot-download limit; returns nil on any failure.
+    private func download(token: String, fileId: String,
+                          maxBytes: Int = 20 * 1024 * 1024) async -> Data? {
+        guard let metaURL = TelegramAPI.getFileURL(token: token, fileId: fileId),
+              let (metaData, metaResp) = try? await session.data(from: metaURL),
+              (metaResp as? HTTPURLResponse)?.statusCode == 200,
+              let filePath = TelegramAPI.parseFilePath(metaData),
+              let dlURL = TelegramAPI.fileDownloadURL(token: token, filePath: filePath),
+              let (bytes, dlResp) = try? await session.data(from: dlURL),
+              (dlResp as? HTTPURLResponse)?.statusCode == 200,
+              !bytes.isEmpty, bytes.count <= maxBytes
+        else { return nil }
+        return bytes
+    }
+
+    // MARK: - Attachment helpers (pure)
+
+    /// Whether an attachment is Ogg/Opus (needs SwiftOGG) vs. an AVFoundation-
+    /// readable container. Telegram voice notes are always Ogg/Opus.
+    private static func attachmentIsOggOpus(_ attachment: TelegramUpdate.Attachment?) -> Bool {
+        switch attachment {
+        case .voice:
+            return true
+        case .document(_, let mime, let name):
+            let m = mime.lowercased(), n = name.lowercased()
+            return m.contains("ogg") || m.contains("opus") || n.hasSuffix(".oga") || n.hasSuffix(".ogg")
+        case .audio, .photo, .none:
+            return false   // `audio` (music) is virtually always mp3/m4a
+        }
+    }
+
+    /// File extension hint for a non-Ogg audio attachment, so the temp file we
+    /// hand AVFoundation is named sensibly (`m4a` when unknown).
+    private static func attachmentAudioExtension(_ attachment: TelegramUpdate.Attachment?) -> String {
+        if case .document(_, _, let name) = attachment {
+            let ext = (name as NSString).pathExtension
+            if !ext.isEmpty { return ext }
+        }
+        return "m4a"
+    }
+
+    private static func transcriptionMessage(for failure: VoiceTranscriber.Failure) -> String {
+        switch failure {
+        case .unavailable(let message): return "🎙️ \(message)"
+        case .noSpeech: return "🎙️ I couldn't make out any speech in that clip. Try recording again."
+        case .failed(let message): return "🎙️ I couldn't transcribe that voice clip: \(message)"
+        }
+    }
+
     // MARK: - Copy
 
     private func startHelp() -> String {
@@ -386,6 +548,7 @@ final class TelegramBridge: ObservableObject {
         return """
         👋 Connected to MLX Core in \(mode).
         Send a message and I'll relay it to your local model.
+        You can also send 📷 photos (vision models will look at them) and 🎙️ voice notes (audio models hear them; other models read an on-device transcript).
         Commands:
         /new — start a fresh conversation
         """

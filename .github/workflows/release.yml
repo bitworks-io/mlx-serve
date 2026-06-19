@@ -234,6 +234,22 @@ jobs:
           # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
           [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
 
+          # YbridOpus + YbridOgg dynamic frameworks (libopus/libogg) pulled by the
+          # SwiftOGG SPM dep — VoicePreprocessor uses them to decode Telegram
+          # Ogg/Opus voice notes. SwiftPM fetched them into app/.build/artifacts;
+          # embed the macOS slice so the app resolves @rpath/Ybrid*.framework at
+          # runtime (without this the .app fails to launch). Mirrors app/build.sh.
+          ARTIFACTS="$(dirname "$SWIFT_BIN_PATH")/artifacts"
+          for fwname in YbridOpus YbridOgg; do
+            fwsrc=$(find "$ARTIFACTS" -path "*macos-arm64*/$fwname.framework" -type d 2>/dev/null | head -1)
+            if [ -n "$fwsrc" ]; then
+              cp -R "$fwsrc" "$CONTENTS/Frameworks/"
+            else
+              echo "::error::$fwname.framework not found under $ARTIFACTS — Telegram voice decode would crash the app"
+              exit 1
+            fi
+          done
+
           # Fix rpaths
           install_name_tool -change \
             "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libmlxc | awk '{print $1}')" \
@@ -266,10 +282,22 @@ jobs:
               "$CONTENTS/Frameworks/libwebp.dylib" 2>/dev/null || true
           fi
 
+          # MLXCore loads the Ybrid frameworks via @rpath/Ybrid*.framework; point
+          # @rpath at the bundled Frameworks dir (SwiftPM's dev rpath into
+          # .build/artifacts doesn't survive packaging, so without this the app
+          # can't launch). Mirrors app/build.sh.
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$CONTENTS/MacOS/MLXCore" 2>/dev/null || true
+
           # Sign inside-out
           chmod -R u+w "$APP"
           for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
             [ -f "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
+          done
+          # Embedded .framework bundles (YbridOpus/YbridOgg) — re-sign over the
+          # vendor signature with our Developer ID + hardened runtime so dyld
+          # accepts them and notarization passes.
+          for fw in "$CONTENTS/Frameworks/"*.framework; do
+            [ -d "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
           done
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
           # MLXCore + the .app need the mic entitlement, or Voice mode is denied

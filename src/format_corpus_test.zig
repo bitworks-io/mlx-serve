@@ -280,6 +280,40 @@ const corpus = [_]Expect{
         .raw = "Here is the summary.\n<|channel>thought\nMore ideas\n<|channel>thought\nEven more",
         .content_exact = "Here is the summary.",
     },
+    .{
+        // 2026-06-19 live Claude Code agentic session (gemma-4): the model
+        // CLOSED its thought channel and IMMEDIATELY re-opened a fresh one with
+        // NOTHING between, then the turn ended. The leading-strip consumed the
+        // first closed block, leaving the bare re-opened opener at the START
+        // (pos 0) of the remainder — the trailing-strip bailed on a pos==0
+        // opener, so the raw `<|channel>thought\n` leaked verbatim into visible
+        // content (it reached chat-history.json as the entire assistant reply).
+        .family = "gemma4",
+        .name = "re-opened thought opener right after close never leaks (thinking on)",
+        .raw = "<|channel>thought\nLet me plan the answer.<channel|>\n<|channel>thought\n",
+        .thinking = true,
+        .content_exact = "",
+        .reasoning_contains = "Let me plan the answer.",
+    },
+    .{
+        // Same shape, thinking OFF → stripThinkBlock path. THIS is the exact
+        // form captured live: visible content was the literal `<|channel>thought\n`.
+        .family = "gemma4",
+        .name = "re-opened thought opener right after close never leaks (thinking off)",
+        .raw = "<|channel>thought\nLet me plan the answer.<channel|>\n<|channel>thought\n",
+        .content_exact = "",
+    },
+    .{
+        // Inverse guard: real content BETWEEN the close and a trailing
+        // re-opened opener must survive — the cut applies only to the dangling
+        // re-open, never to the answer that preceded it.
+        .family = "gemma4",
+        .name = "content between close and re-opened opener survives",
+        .raw = "<|channel>thought\nPlan it.<channel|>\nThe file is ready.<|channel>thought\n",
+        .thinking = true,
+        .content_exact = "The file is ready.",
+        .reasoning_contains = "Plan it.",
+    },
     // ── Gemma 3 (no native tool syntax — markdown-fenced JSON) ──────────────
     .{
         // Verbatim capture from gemma-3-12b-it-qat-4bit on the live matrix

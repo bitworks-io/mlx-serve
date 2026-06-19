@@ -127,6 +127,10 @@ class APIClient {
         let caps = first["capabilities"] as? [String] ?? []
         let mods = first["input_modalities"] as? [String] ?? []
         let supportsAudio = caps.contains("audio") || mods.contains("audio")
+        // Vision is advertised the same way; it drops out automatically when the
+        // server runs with `--no-vision` (the encoder isn't loaded), so this is
+        // the live "can this model see images right now?" signal.
+        let supportsVision = caps.contains("vision") || mods.contains("image")
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
@@ -143,6 +147,7 @@ class APIClient {
             architecture: meta["architecture"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
+            supportsVision: supportsVision,
             supportsEmbeddings: supportsEmbeddings,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,

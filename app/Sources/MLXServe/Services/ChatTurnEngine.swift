@@ -634,12 +634,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 )
                 roundOutputs.append(result.output)
 
-                // Show result in chat (display-only)
-                var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")
-                resultMsg.isAgentSummary = true
-                appState.appendMessage(to: sessionId, message: resultMsg)
-
-                // Store tool result as tool role message
+                // Build the model-facing tool message FIRST, so the visible
+                // summary can mirror it 1:1 (same content the model receives —
+                // no separate, smaller display cap).
                 var toolMsg = ChatMessage(role: .system, content: "")
                 toolMsg.toolCallId = result.id
                 toolMsg.toolName = result.name
@@ -663,6 +660,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 } else {
                     toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                 }
+
+                // Visible summary (display-only) — exactly what the model sees.
+                var resultMsg = ChatMessage(role: .assistant,
+                    content: AgentEngine.toolResultSummary(name: result.name, modelContent: toolMsg.content))
+                resultMsg.isAgentSummary = true
+                appState.appendMessage(to: sessionId, message: resultMsg)
                 appState.appendMessage(to: sessionId, message: toolMsg)
             }
 
